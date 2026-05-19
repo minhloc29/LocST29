@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VSCode
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# PyTorch / Lightning checkpoints
+*.ckpt
+**/*.ckpt
+
+# Model weights
+*.pt
+*.pth
+*.bin
+
+# Data files
+data/
+datasets/
+
+# Outputs
+outputs/
+results/
+runs/
+wandb/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
