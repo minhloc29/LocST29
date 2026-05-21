@@ -9,10 +9,15 @@ from HIST2ST import *
 from predict import *
 from torch.utils.data import DataLoader
 from pytorch_lightning.loggers import TensorBoardLogger
+from difficulty_tracking import train_with_difficulty_tracking
+import pandas as pd
+from difficulty_visualization import *
+
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--gpu', type=int, default=2, help='the id of gpu.')
-parser.add_argument('--fold', type=int, default=5, help='dataset fold.')
+
+parser.add_argument('--gpu', type=int, default=0, help='the id of gpu.')
+parser.add_argument('--fold', type=int, default=1, help='dataset fold.')
 parser.add_argument('--seed', type=int, default=12000, help='random seed.')
 parser.add_argument('--epochs', type=int, default=350, help='number of epochs.')
 parser.add_argument('--name', type=str, default='hist2ST', help='prefix name.')
@@ -89,12 +94,22 @@ model = Hist2ST(
     bake=args.bake, lamb=args.lamb, 
     policy=args.policy, 
 )
+
+# trainer = pl.Trainer(
+#     gpus=[args.gpu], max_epochs=args.epochs,
+#     logger=logger,check_val_every_n_epoch=2,
+# )
 trainer = pl.Trainer(
-    gpus=[args.gpu], max_epochs=args.epochs,
-    logger=logger,check_val_every_n_epoch=2,
+    accelerator="gpu",
+    devices=[args.gpu],
+    max_epochs=args.epochs,
+    logger=logger,
+    check_val_every_n_epoch=2,
 )
 
 trainer.fit(model, train_loader, test_loader)
+
+
 torch.save(model.state_dict(),f"./model/{args.fold}-Hist2ST{'_cscc' if args.data=='cscc' else ''}.ckpt")
 # model.load_state_dict(torch.load(f"./model/{args.fold}-Hist2ST{'_cscc' if args.data=='cscc' else ''}.ckpt"),)
 pred, gt = test(model, test_loader,'cuda')

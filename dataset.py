@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import ImageFile, Image
-from utils import read_tiff, get_data
 from graph_construction import calcADJ
 from collections import defaultdict as dfd
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -51,6 +50,7 @@ class ViT_HER2ST(torch.utils.data.Dataset):
             self.names = tr_names
         else:
             self.names = te_names
+            # self.names = samples
 
         print('Loading imgs...')
         self.img_dict = {i:torch.Tensor(np.array(self.get_img(i))) for i in self.names}

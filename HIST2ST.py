@@ -11,6 +11,10 @@ from copy import deepcopy as dcp
 from collections import defaultdict as dfd
 from sklearn.metrics import adjusted_rand_score as ari_score
 from sklearn.metrics.cluster import normalized_mutual_info_score as nmi_score
+import anndata as ann
+from sklearn.cluster import KMeans
+
+
 class convmixer_block(nn.Module):
     def __init__(self,dim,kernel_size):
         super().__init__()
@@ -31,6 +35,7 @@ class convmixer_block(nn.Module):
         x=self.dw(x)+x
         x=self.pw(x)
         return x
+    
 class mixer_transformer(nn.Module):
     def __init__(self,channel=32, kernel_size=5, dim=1024,
                  depth1=2, depth2=8, depth3=4, 
@@ -62,6 +67,7 @@ class mixer_transformer(nn.Module):
         g=torch.cat(jk,0)
         g=self.jknet(g).mean(0)
         return g
+    
 class ViT(nn.Module):
     def __init__(self, channel=32,kernel_size=5,dim=1024, 
                  depth1=2, depth2=8, depth3=4, 
