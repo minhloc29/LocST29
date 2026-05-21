@@ -47,3 +47,8 @@ wandb/
 tmp/
 temp/
 *.tmp
+
+
+results/
+model/
+data/
