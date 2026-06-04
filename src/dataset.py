@@ -228,6 +228,7 @@ class Her2STDataset(Dataset):
         y = df["y"].values
         x = np.around(x).astype(int)
         y = np.around(y).astype(int)
+        
         spot_id = []
         for i in range(len(x)):
             spot_id.append(str(x[i]) + "x" + str(y[i]))
@@ -410,8 +411,10 @@ class SpatialModelAdapter(torch.nn.Module):
         patches, positions, adj = batch
         if adj is not None and adj.ndim == 3 and adj.shape[0] == 1:
             adj = adj.squeeze(0)
-        pred, _, _ = self.model(patches, positions, adj)
-        return pred
+        output = self.model(patches, positions, adj)
+        if isinstance(output, (list, tuple)):
+            return output[0]
+        return output
 
 
 class SingleSlideAdapter(Dataset):
@@ -504,6 +507,7 @@ def compute_phase1_results(
 
         if pred.ndim >= 3 and pred.shape[0] == 1:
             pred = pred.squeeze(0)
+        if target.ndim >= 3 and target.shape[0] == 1:
             target = target.squeeze(0)
 
         all_pred.append(pred)
@@ -512,6 +516,10 @@ def compute_phase1_results(
 
     pred_all = np.concatenate(all_pred, axis=0)
     target_all = np.concatenate(all_target, axis=0)
+    if pred_all.ndim >= 3 and pred_all.shape[0] == 1:
+        pred_all = pred_all.squeeze(0)
+    if target_all.ndim >= 3 and target_all.shape[0] == 1:
+        target_all = target_all.squeeze(0)
     idx_all = np.concatenate(all_idx, axis=0)
 
     n_spots = coords.shape[0]

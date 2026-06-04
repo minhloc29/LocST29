@@ -1,0 +1,26 @@
+{
+  "curriculum_PCC": 0.35896947979927063,
+  "curriculum_MSE": 0.46338826417922974,
+  "curriculum_MAE": 0.5179516077041626,
+  "baseline_PCC": 0.3563385009765625,
+  "baseline_MSE": 0.47197940945625305,
+  "baseline_MAE": 0.5311757922172546,
+  "calibration_error": 0.5179484486579895,
+  "convergence_epoch": 1,
+  "hard_region_metrics": {
+    "Curriculum_Hard_MSE": 0.4852556884288788,
+    "Curriculum_Hard_MAE": 0.5390307307243347,
+    "Curriculum_Hard_PCC": 0.3225170373916626,
+    "Curriculum_Hard_n_spots": 83,
+    "Baseline_Hard_MSE": 0.5060311555862427,
+    "Baseline_Hard_MAE": 0.5598917007446289,
+    "Baseline_Hard_PCC": 0.3171808421611786,
+    "Baseline_Hard_n_spots": 83,
+    "MSE_gain": 0.02077546715736389,
+    "MAE_gain": 0.02086097002029419,
+    "PCC_gain": 0.005336195230484009,
+    "hard_region_fraction": 0.25
+  },
+  "biological_overlaps": {},
+  "spatial_error_autocorr": null
+}

@@ -6,7 +6,7 @@ import torch.nn as nn
 from dataclasses import dataclass, field
 from typing import Optional, List, Callable, Tuple
 
-from ..utils import build_spatial_graph, smooth_on_graph
+from ..utils import build_spatial_graph, smooth_on_graph, expand_mask_k_hops
 from ..utils import (
     move_to_device,
     flatten_indices,
@@ -19,15 +19,16 @@ from ..dynamics.dynamics import SpatialDynamicsField
 @dataclass
 class Config:
     """Hyper-parameters for the topology-aware curriculum."""
-    tau_start: float = 0.3
-    tau_end: float = 0.95
-    tau_warmup_epochs: int = 5
-    graph_diffusion_steps: int = 2
+    tau_start: float = 0.1
+    tau_end: float = 1.0
+    tau_warmup_epochs: int = 200
+    graph_diffusion_steps: int = 1
     k_neighbours: int = 6
     stability_weight: float = 0.5
     val_plateau_patience: int = 3
     min_mask_fraction: float = 0.10
     device: str = "cpu"
+    graph_expansion_hops: int = 0
 
 
 class AdaptiveThresholdScheduler:
@@ -75,37 +76,47 @@ class TopologyAwareCurriculumSampler:
 
     def __init__(self, field: SpatialDynamicsField, cfg: Config):
         self.cfg = cfg
-        self.D_bar = field.D_bar
+        self.difficulty_score = field.difficulty_score
         self.coords = field.coords
         self.N = field.N
         self.edge_index, self.edge_weight = build_spatial_graph(self.coords, k=cfg.k_neighbours)
         self._prev_mask: Optional[np.ndarray] = None
 
     def get_mask(self, tau: float) -> np.ndarray:
-        """
-        Compute spot inclusion mask for threshold tau.
-        Returns bool array of shape (N,).
-        """
-        base_mask = (self.D_bar <= tau).astype(np.float32)
+       
+        n_active = max(
+            int(tau * self.N),
+            int(self.cfg.min_mask_fraction * self.N)
+        )
 
-        if base_mask.mean() < self.cfg.min_mask_fraction:
-            n_min = int(self.cfg.min_mask_fraction * self.N)
-            top_easy = np.argsort(self.D_bar)[:n_min]
-            base_mask[top_easy] = 1.0
+        idx = np.argsort(self.difficulty_score)
 
+        base_mask = np.zeros(self.N, dtype=np.float32)
+        base_mask[idx[:n_active]] = 1.0
+        
         expanded = base_mask.copy()
         for _ in range(self.cfg.graph_diffusion_steps):
-            expanded = smooth_on_graph(expanded, self.edge_index, self.edge_weight, n_iter=1)
-            expanded = (expanded > 0.05).astype(np.float32)
-
+            # expanded = smooth_on_graph(expanded, self.edge_index, self.edge_weight, n_iter=1)
+            # expanded = (expanded > 0.3).astype(np.float32)
+            expanded = expand_mask_k_hops(
+                base_mask.astype(bool),
+                self.edge_index,
+                k=self.cfg.graph_expansion_hops,
+            )
         if self._prev_mask is not None:
             lam = self.cfg.stability_weight
             combined = lam * self._prev_mask + (1 - lam) * expanded
-            final_mask = (combined > 0.5).astype(bool)
+            final_mask = (combined >= 0.5).astype(bool)
         else:
             final_mask = expanded.astype(bool)
 
         self._prev_mask = final_mask.astype(np.float32)
+        print(
+        f"tau={tau:.3f} | "
+        f"base={base_mask.sum()} | "
+        f"expanded={expanded.sum()} | "
+        f"final={final_mask.sum() if self._prev_mask is not None else expanded.sum()}"
+    )
         return final_mask
 
     def mask_to_indices(self, mask: np.ndarray) -> np.ndarray:
@@ -138,13 +149,7 @@ def curriculum_train_epoch(
     active_indices: np.ndarray,
     device: torch.device,
 ) -> float:
-    """
-    One curriculum training epoch: only compute loss on active spots.
-
-    Returns
-    -------
-    Mean training loss over active spots.
-    """
+   
     model.train()
     active_set = set(active_indices.tolist())
     total_loss, total_n = 0.0, 0
@@ -155,6 +160,8 @@ def curriculum_train_epoch(
             [i for i, sp in enumerate(idx_flat.tolist()) if sp in active_set],
             dtype=torch.long,
         )
+        
+        
         if len(keep) == 0:
             continue
 
@@ -163,13 +170,30 @@ def curriculum_train_epoch(
 
         optimizer.zero_grad()
         pred = model(x_k)
+        if isinstance(pred, tuple):
+            pred = pred[0]
+
+        if y_k.ndim == 3 and y_k.shape[0] == 1:
+            y_k = y_k.squeeze(0)
+
+        if pred.ndim == 3 and pred.shape[0] == 1:
+            pred = pred.squeeze(0)
+        
+        assert pred.shape == y_k.shape, (
+            f"pred={pred.shape}, target={y_k.shape}"
+        )
+             
         loss = loss_fn(pred, y_k)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0
+        )
         optimizer.step()
 
         total_loss += loss.item() * len(keep)
         total_n += len(keep)
-
+    
     return total_loss / max(total_n, 1)
 
 
@@ -186,13 +210,27 @@ def evaluate(
     for x, y, _ in loader:
         x = move_to_device(x, device)
         pred = model(x)
+        
+        if isinstance(pred, tuple):
+            pred = pred[0]
+
+        y = y.to(device)
+        if y.ndim == 3 and y.shape[0] == 1:
+            y = y.squeeze(0)
+
+        if pred.ndim == 3 and pred.shape[0] == 1:
+            pred = pred.squeeze(0)
+        
+        assert y.shape == pred.shape, (
+            f"pred={pred.shape}, target={y.shape}"
+        )
+        
         loss = loss_fn(pred, y.to(device))
-        if y.ndim >= 3 and y.shape[0] == 1:
-            batch_n = y.shape[1]
-        else:
-            batch_n = y.shape[0]
+        batch_n = y.shape[0]
         total_loss += loss.item() * batch_n
         total_n += batch_n
+        
+    
     return total_loss / max(total_n, 1)
 
 

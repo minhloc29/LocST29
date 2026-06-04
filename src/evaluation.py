@@ -13,18 +13,47 @@ from .utils import move_to_device, flatten_indices
 from .utils import prepare_morans_adata, morans_i_scanpy_from_adata
 
 
-def pearson_correlation_coefficient(pred: np.ndarray, target: np.ndarray) -> float:
-    """Spot-level PCC averaged over genes, or gene-level PCC averaged over spots."""
+def pearson_correlation_coefficient(
+    pred: np.ndarray,
+    target: np.ndarray,
+    mode: str = "spot",
+) -> float:
+    """
+    PCC averaged over spots (mode='spot', default) or genes (mode='gene').
+ 
+    Spot-wise  — for each spot, correlate its predicted expression vector
+                 with the true vector across genes, then average over spots.
+                 This is the ST benchmarking standard (Hist2ST, iStar, etc.).
+ 
+    Gene-wise  — for each gene, correlate predicted vs true values across
+                 spots, then average over genes.  Kept for reference only.
+ 
+    1-D inputs fall back to a single Pearson r.
+    """
     if pred.ndim == 1:
         r, _ = pearsonr(pred, target)
         return float(r)
-    pccs = []
-    for g in range(pred.shape[1]):
-        if target[:, g].std() < 1e-8:
-            continue
-        r, _ = pearsonr(pred[:, g], target[:, g])
-        pccs.append(r)
-    return float(np.mean(pccs)) if pccs else float("nan")
+ 
+    if mode == "spot":
+        # iterate over spots (axis 0), correlate across genes (axis 1)
+        pccs = []
+        for i in range(pred.shape[0]):
+            p, t = pred[i], target[i]
+            if t.std() < 1e-8 or p.std() < 1e-8:
+                continue
+            r, _ = pearsonr(p, t)
+            pccs.append(r)
+    else:
+        # gene-wise: iterate over genes (axis 1), correlate across spots
+        pccs = []
+        for g in range(pred.shape[1]):
+            p, t = pred[:, g], target[:, g]
+            if t.std() < 1e-8 or p.std() < 1e-8:
+                continue
+            r, _ = pearsonr(p, t)
+            pccs.append(r)
+ 
+    return float(np.nanmean(pccs)) if pccs else float("nan")
 
 
 def mse(pred: np.ndarray, target: np.ndarray) -> float:
@@ -40,10 +69,7 @@ def calibration_error(
     target: np.ndarray,
     n_bins: int = 10,
 ) -> float:
-    """
-    Simplified calibration error (ECE proxy for regression):
-    bins predictions by magnitude; checks mean |pred-target| per bin.
-    """
+    
     flat_pred = pred.ravel()
     flat_target = target.ravel()
     bins = np.percentile(flat_pred, np.linspace(0, 100, n_bins + 1))
@@ -104,10 +130,7 @@ def boundary_hard_evaluation(
     field: SpatialDynamicsField,
     percentile: float = 75.0,
 ) -> Dict[str, float]:
-    """
-    Compare curriculum vs baseline on high-difficulty boundary regions.
-    Returns dict of metrics and performance gains.
-    """
+    
     hard_mask = field.D_bar > np.percentile(field.D_bar, percentile)
 
     curr_metrics = per_region_metrics(pred_curriculum, target, hard_mask, "Curriculum_Hard")
@@ -238,11 +261,14 @@ def spatial_error_autocorrelation(
     Returns a report and the shuffled Moran's I values.
     """
     errors = compute_error_vector(pred, target)
+    
     adata = prepare_morans_adata(
         n_obs=len(errors),
         coords=coords,
         k_neighbours=k_neighbours,
     )
+    
+    
 
     morans_i_stat, pval = morans_i_scanpy_from_adata(adata, errors, n_perms=n_perm)
 
@@ -279,22 +305,30 @@ def predict_all(
     loader,
     device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Run inference over the full loader.
-    Returns (predictions, targets, spot_indices) as numpy arrays.
-    """
+  
     model.eval()
     all_pred, all_target, all_idx = [], [], []
     for x, y, idx in loader:
         x = move_to_device(x, device)
-        pred = model(x).detach().cpu().numpy()
+        out = model(x)
+
+        pred = out
+
+        if y.ndim == 3 and y.shape[0] == 1:
+            y = y.squeeze(0)
+            
+        pred = pred.detach().cpu().numpy()
         target = y.detach().cpu().numpy()
         idx_flat = flatten_indices(idx).cpu().numpy()
 
+    
         if pred.ndim >= 3 and pred.shape[0] == 1:
             pred = pred.squeeze(0)
-            target = target.squeeze(0)
 
+        assert pred.shape == y.shape, (
+                    f"pred={pred.shape}, target={y.shape}"
+                )
+        
         all_pred.append(pred)
         all_target.append(target)
         all_idx.append(idx_flat)
@@ -334,9 +368,7 @@ def run_phase5(
     n_perm: int = 999,
     n_shuffles: int = 100,
 ) -> EvaluationReport:
-    """
-    End-to-end Phase 5 evaluation.
-    """
+    
     N = field.N
     print("[Phase 5] Running inference on curriculum model...")
     cp, ct, ci = predict_all(curriculum_model, test_loader, device)

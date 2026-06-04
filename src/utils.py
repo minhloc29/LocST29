@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
-import inspect
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import torch
 import anndata as ad
-import scanpy as sc
 from pathlib import Path
 from scipy.spatial import distance
+from scipy.sparse import csr_matrix
 
 
 @dataclass
@@ -60,60 +59,7 @@ def smooth_on_graph(
     n_iter: int = 1,
     alpha: float = 0.7,
 ) -> np.ndarray:
-    """
-    Graph diffusion / neighbor smoothing.
-
-    Update rule:
-        X_new = alpha * A_norm @ X + (1 - alpha) * X
-
-    where:
-        A_norm = row-normalized adjacency
-
-    Parameters
-    ----------
-    values:
-        Node features.
-
-        Shape:
-            (N,)     -> scalar value per node
-            (N, D)   -> D-dimensional feature per node
-
-    edge_index:
-        Graph connectivity.
-
-        Shape:
-            (2, E)
-
-        edge_index[0] = source nodes
-        edge_index[1] = destination nodes
-
-    edge_weight:
-        Edge importance.
-
-        Shape:
-            (E,)
-
-    n_iter:
-        Number of diffusion iterations.
-
-    alpha:
-        Diffusion strength.
-
-        alpha=1.0
-            pure smoothing
-
-        alpha=0.0
-            keep original values
-
-    Returns
-    -------
-    out:
-        Smoothed values
-
-        Shape:
-            same as values
-    """
-
+    
     out = values.astype(np.float32)
     N = out.shape[0]
 
@@ -147,6 +93,41 @@ def smooth_on_graph(
     return out
 
 
+def expand_mask_one_hop(
+    mask: np.ndarray,
+    edge_index: np.ndarray,
+):
+    """
+    Expand active spots by one graph hop.
+    """
+
+    expanded = mask.copy()
+
+    for src, dst in zip(
+        edge_index[0],
+        edge_index[1]
+    ):
+        if mask[src]:
+            expanded[dst] = True
+
+    return expanded
+
+
+def expand_mask_k_hops(
+    mask: np.ndarray,
+    edge_index: np.ndarray,
+    k: int = 1,
+):
+    expanded = mask.copy()
+
+    for _ in range(k):
+        expanded = expand_mask_one_hop(
+            expanded,
+            edge_index,
+        )
+
+    return expanded
+
 def normalise_difficulty(values: np.ndarray) -> np.ndarray:
     """Min-max normalize to [0, 1] with numerical safety."""
     vmin = float(np.min(values))
@@ -156,25 +137,26 @@ def normalise_difficulty(values: np.ndarray) -> np.ndarray:
     return ((values - vmin) / (vmax - vmin)).astype(np.float32)
 
 
-def _as_scalar(value) -> float:
-    arr = np.asarray(value)
-    return float(arr.ravel()[0])
+def _row_normalize(mat: np.ndarray) -> np.ndarray:
+    row_sum = mat.sum(axis=1, keepdims=True)
+    row_sum = np.maximum(row_sum, 1e-12)
+    return mat / row_sum
 
 
-def _parse_morans_i_output(result) -> Tuple[float, float]:
-    if isinstance(result, (tuple, list)) and len(result) >= 2:
-        return _as_scalar(result[0]), _as_scalar(result[1])
+def _morans_i_from_graph(values: np.ndarray, W: np.ndarray) -> float:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    if W.shape[0] != W.shape[1] or W.shape[0] != vals.shape[0]:
+        raise ValueError("W must be (N, N) with N == len(values)")
+    if vals.size < 2:
+        return float("nan")
 
-    if hasattr(result, "columns"):
-        if "I" in result.columns:
-            i_val = _as_scalar(result["I"].values)
-            if "pval" in result.columns:
-                return i_val, _as_scalar(result["pval"].values)
-            if "p" in result.columns:
-                return i_val, _as_scalar(result["p"].values)
-            return i_val, float("nan")
-
-    return _as_scalar(result), float("nan")
+    W_norm = _row_normalize(W)
+    z = vals - vals.mean()
+    denom = np.sum(z**2)
+    if denom <= 1e-12:
+        return float("nan")
+    numerator = z @ (W_norm @ z)
+    return float(numerator / denom)
 
 
 def prepare_morans_adata(
@@ -188,11 +170,21 @@ def prepare_morans_adata(
 
     adata = ad.AnnData(np.zeros((n_obs, 1), dtype=np.float32))
     if adj is not None:
-        adata.obsp["connectivities"] = np.asarray(adj)
+        adata.obsp["connectivities"] = csr_matrix(adj)
         return adata
 
-    adata.obsm["spatial"] = np.asarray(coords)
-    sc.pp.neighbors(adata, n_neighbors=k_neighbours, use_rep="spatial")
+    coords = np.asarray(coords)
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        raise ValueError("coords must have shape (N, 2)")
+
+    nbrs = NearestNeighbors(n_neighbors=min(k_neighbours + 1, n_obs)).fit(coords)
+    distances, indices = nbrs.kneighbors(coords)
+
+    W = np.zeros((n_obs, n_obs), dtype=np.float32)
+    for i in range(n_obs):
+        for j, dist in zip(indices[i][1:], distances[i][1:]):
+            W[i, j] = 1.0 / (dist + 1e-8)
+    adata.obsp["connectivities"] = csr_matrix(W)
     return adata
 
 
@@ -201,25 +193,24 @@ def morans_i_scanpy_from_adata(
     values: np.ndarray,
     n_perms: Optional[int] = 999,
 ) -> Tuple[float, float]:
+    if "connectivities" not in adata.obsp:
+        raise ValueError("Missing connectivities in adata.obsp")
+    W = np.asarray(adata.obsp["connectivities"].todense())
     vals = np.asarray(values)
-    if vals.ndim == 1:
-        vals = vals[:, None]
+    if vals.ndim > 1:
+        vals = vals.mean(axis=1)
 
-    params = inspect.signature(sc.metrics.morans_i).parameters
-    kwargs = {}
-    if "vals" in params:
-        kwargs["vals"] = vals
-    else:
-        adata.X = vals
+    morans_i = _morans_i_from_graph(vals, W)
+    if n_perms is None or n_perms <= 0:
+        return morans_i, float("nan")
 
-    if "use_graph" in params and "connectivities" in adata.obsp:
-        kwargs["use_graph"] = "connectivities"
+    perm_vals = np.zeros(n_perms, dtype=np.float64)
+    for i in range(n_perms):
+        perm = np.random.permutation(vals)
+        perm_vals[i] = _morans_i_from_graph(perm, W)
 
-    if "n_perms" in params and n_perms is not None:
-        kwargs["n_perms"] = n_perms
-
-    result = sc.metrics.morans_i(adata, **kwargs)
-    return _parse_morans_i_output(result)
+    p_val = float((np.sum(perm_vals >= morans_i) + 1.0) / (n_perms + 1.0))
+    return morans_i, p_val
 
 
 def morans_i_scanpy(
@@ -319,3 +310,40 @@ def calc_adj(coord, k: int = 8, distance_type: str = "euclidean", prune_tag: str
                 if dist_mat[0, res[0][j]] <= 2.0:
                     adj[i][res[0][j]] = 1.0
     return adj
+
+
+
+
+class EarlyStopping:
+    def __init__(
+        self,
+        patience=20,
+        min_delta=1e-4,
+    ):
+        self.patience = patience
+        self.min_delta = min_delta
+
+        self.best_loss = float("inf")
+        self.counter = 0
+
+        self.best_state = None
+
+    def step(self, val_loss, model):
+        improved = (
+            self.best_loss - val_loss
+        ) > self.min_delta
+
+        if improved:
+            self.best_loss = val_loss
+            self.counter = 0
+
+            self.best_state = {
+                k: v.cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+
+            return False
+
+        self.counter += 1
+
+        return self.counter >= self.patience

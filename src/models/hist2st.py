@@ -227,6 +227,11 @@ class Hist2ST(nn.Module):
         )
 
     def forward(self, patches, centers, adj, aug=False):
+        '''
+            patch: local tissue, RGB images
+            centers: spatial cooridnate of each spot
+        '''
+        
         b, n, c, h, w = patches.shape
         patches = patches.reshape(b * n, c, h, w)
         patches = self.patch_embedding(patches)
@@ -248,7 +253,8 @@ class Hist2ST(nn.Module):
                 extra = (m, d, p)
         if aug:
             h = self.coef(h)
-        return x, extra, h
+        # return x, extra, h
+        return x
 
     def aug(self, patch, center, adj):
         bake_x = []

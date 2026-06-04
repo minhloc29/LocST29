@@ -16,7 +16,7 @@ from .curriculum.curriculum import Config, run_phase4, TrainingLog
 from .evaluation import (
     BiologicalAnnotations, EvaluationReport, run_phase5
 )
-from .utils import move_to_device
+from .utils import move_to_device, EarlyStopping
 
 
 @dataclass
@@ -33,7 +33,7 @@ class PipelineConfig:
 
     # Phase 4
     curriculum: Config = field(default_factory=Config)
-    total_epochs: int = 50
+    total_epochs: int = 300
 
     # Phase 5
     hard_percentile: float = 75.0
@@ -42,6 +42,7 @@ class PipelineConfig:
     device: str = "cpu"
     seed: int = 42
 
+    warmup_ratio: float = 0.3
 
 class SpatialCurriculumPipeline:
     """
@@ -180,9 +181,16 @@ class SpatialCurriculumPipeline:
         """
         device = torch.device(self.cfg.device)
 
+        
+        
         # Warm-up: collect dynamics (short run, no curriculum)
         print("\n[Pipeline] Warm-up training to collect difficulty dynamics...")
-        warmup_epochs = min(10, self.cfg.total_epochs // 5)
+        
+        warmup_epochs = int(
+            self.cfg.total_epochs
+            * self.cfg.warmup_ratio
+        )
+        
         cb = EpochMSECallback(n_spots=self.p1.coords.shape[0])
         model.to(device)
         model.train()
@@ -190,8 +198,29 @@ class SpatialCurriculumPipeline:
             for x, y, _ in train_loader:
                 optimizer.zero_grad()
                 x = move_to_device(x, device)
-                loss = loss_fn(model(x), y.to(device))
+                pred = model(x)
+                if isinstance(pred, tuple):
+                    pred = pred[0]
+
+                y = y.to(device)
+
+                if pred.ndim == 3 and pred.shape[0] == 1:
+                    pred = pred.squeeze(0)
+                if y.ndim == 3 and y.shape[0] == 1:
+                    y = y.squeeze(0)
+
+                assert pred.shape == y.shape, (
+                    f"pred={pred.shape}, target={y.shape}"
+                )
+                
+                loss = loss_fn(pred, y)
                 loss.backward()
+                
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=1.0
+                )
+                
                 optimizer.step()
             cb.record(model, val_loader, device)
 

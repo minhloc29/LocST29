@@ -21,6 +21,7 @@ from src import (
     prepare_phase1,
 )
 
+from src.utils import EarlyStopping
 
 def parse_json_arg(value: str) -> Dict[str, Any]:
     if not value:
@@ -50,6 +51,19 @@ def train_baseline(
             x = _move_to_device(x, device)
             y = y.to(device)
             pred = model(x)
+            if isinstance(pred, tuple):
+                pred = pred[0]
+
+            if y.ndim == 3 and y.shape[0] == 1:
+                y = y.squeeze(0)
+            
+            if pred.ndim == 3 and pred.shape[0] == 1:
+                pred = pred.squeeze(0)
+            
+            assert pred.shape == y.shape, (
+                    f"pred={pred.shape}, target={y.shape}"
+                )
+            
             loss = loss_fn(pred, y)
             loss.backward()
             optimizer.step()
@@ -68,13 +82,16 @@ def main() -> None:
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--train-slide-index", type=int, default=0)
     parser.add_argument("--test-slide-index", type=int, default=0)
-    parser.add_argument("--total-epochs", type=int, default=50)
-    parser.add_argument("--baseline-epochs", type=int, default=50)
+    parser.add_argument("--total-epochs", type=int, default=200)
+    parser.add_argument("--baseline-epochs", type=int, default=200)
+    parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--flatten", action="store_true", default=False)
+    parser.add_argument("--no-flatten", action="store_false", dest="flatten")
 
     parser.add_argument("--model-module", required=True)
     parser.add_argument("--model-class", required=True)
@@ -89,6 +106,8 @@ def main() -> None:
     parser.add_argument("--output-dir", default="./runs/run1")
     parser.add_argument("--resume", default="")
 
+    
+
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -99,7 +118,7 @@ def main() -> None:
         dataset=args.dataset,
         fold=args.fold,
         adj=True,
-        flatten=True,
+        flatten=args.flatten,
         data_root=data_root,
     )
 
@@ -144,17 +163,16 @@ def main() -> None:
         if args.wrap_model:
             baseline_model = SpatialModelAdapter(baseline_model)
 
+    init_state = {
+        k: v.detach().cpu().clone()
+        for k, v in model.state_dict().items()
+    }
+    
+    model.load_state_dict(init_state)
+    baseline_model.load_state_dict(init_state)
+    
     loss_fn = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    print("[Phase 1] Preparing Phase 1 outputs...")
-    p1, adata = prepare_phase1(
-        cfg=data_cfg,
-        model=model,
-        slide_index=args.test_slide_index,
-        output_dir=args.output_dir,
-        device=args.device,
-    )
 
     if args.baseline_epochs > 0:
         print("[Baseline] Training baseline model...")
@@ -167,6 +185,24 @@ def main() -> None:
             device=torch.device(args.device),
             epochs=args.baseline_epochs,
         )
+    elif args.baseline_only:
+        raise ValueError("baseline-only mode requires --baseline-epochs > 0")
+
+    if args.baseline_only:
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(baseline_model.state_dict(), output_dir / "baseline_model.pt")
+        print("Baseline-only training complete.")
+        return
+
+    print("[Phase 1] Preparing Phase 1 outputs...")
+    p1, adata = prepare_phase1(
+        cfg=data_cfg,
+        model=model,
+        slide_index=args.test_slide_index,
+        output_dir=args.output_dir,
+        device=args.device,
+    )
 
     cfg = PipelineConfig(total_epochs=args.total_epochs, device=args.device, seed=args.seed)
     pipe = SpatialCurriculumPipeline(p1, cfg)
@@ -199,5 +235,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
 
 

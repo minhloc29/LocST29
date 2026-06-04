@@ -1,0 +1,5 @@
+python train.py --model-module src.models.hist2st --model-class Hist2ST --no-flatten
+
+
+
+python train.py --model-module src.models.hist2st --model-class Hist2ST --baseline-only --baseline-epochs 50 --no-flatten

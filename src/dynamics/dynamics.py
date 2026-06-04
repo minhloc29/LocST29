@@ -20,7 +20,7 @@ class SpatialDynamicsField:
     D_field  : (T, N) raw normalized difficulty at each epoch
     D_bar    : (N,) persistent hardness
     dD_dt    : (N,) learning speed (signed slope)
-    speed_abs: (N,) absolute learning speed
+    learning_speed: (N,) absolute learning speed
     volatility: (N,) temporal variance
     T_L      : (N,) learning time (epoch index; T if never learned)
     coords   : (N, 2)
@@ -28,11 +28,13 @@ class SpatialDynamicsField:
     D_field: np.ndarray
     D_bar: np.ndarray
     dD_dt: np.ndarray
-    speed_abs: np.ndarray
+    learning_speed: np.ndarray
     volatility: np.ndarray
     T_L: np.ndarray
     coords: np.ndarray
 
+    difficulty_score: np.ndarray
+    
     @property
     def T(self) -> int:
         return self.D_field.shape[0]
@@ -55,9 +57,16 @@ def build_dynamics_field(
     """
     T, _ = dynamics.epoch_mse.shape
 
-    D_field = np.stack([
-        normalise_difficulty(dynamics.epoch_mse[t]) for t in range(T)
-    ])
+    all_mse = dynamics.epoch_mse
+
+    global_min = all_mse.min()
+    global_max = all_mse.max()
+
+    D_field = (
+        all_mse - global_min
+    ) / (
+        global_max - global_min + 1e-8
+    )
 
     D_bar = D_field.mean(axis=0)
 
@@ -67,21 +76,43 @@ def build_dynamics_field(
     den = (t_c ** 2).sum()
     dD_dt = (num / (den + 1e-10)).astype(np.float32)
 
-    speed_abs = np.abs(dD_dt)
+    learning_speed = -dD_dt
     volatility = D_field.var(axis=0).astype(np.float32)
 
     # Learning time: first epoch where difficulty < threshold
-    below = D_field < learn_threshold
-    T_L = np.where(below.any(axis=0), below.argmax(axis=0), T).astype(np.int32)
+    N = D_field.shape[1]
+    T_L = np.full(N, T, dtype=np.int32)
 
+    consecutive = 3
+    for i in range(N):
+
+        hard = D_field[:, i]
+        for t in range(T - consecutive + 1):
+
+            window = hard[t:t+consecutive]
+            if np.all(window < learn_threshold):
+                T_L[i] = t
+                break
+
+    def normalize(x):
+        return (x - x.min()) / (x.max() - x.min() + 1e-8)
+
+    D_bar_n = normalize(D_bar)
+    vol_n = normalize(volatility)
+    TL_n = normalize(T_L.astype(np.float32))
+    speed_n = normalize(learning_speed)
+
+    difficulty_score = (0.40 * D_bar_n+ 0.25 * TL_n+ 0.20 * vol_n- 0.15 * speed_n)
+    
     return SpatialDynamicsField(
         D_field=D_field,
         D_bar=D_bar,
         dD_dt=dD_dt,
-        speed_abs=speed_abs,
+        learning_speed=learning_speed,
         volatility=volatility,
         T_L=T_L,
         coords=dynamics.coords,
+        difficulty_score=difficulty_score
     )
 
 
@@ -115,14 +146,14 @@ def analyse_topology(
     if hard_mask.sum() > dbscan_min_samples:
         hard_coords = coords[hard_mask]
         db = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples)
-        sub_labels = db.fit_predict(StandardScaler().fit_transform(hard_coords))
+        sub_labels = db.fit_predict(hard_coords)
         sub_labels_shifted = np.where(sub_labels >= 0, sub_labels, -1)
         cluster_labels[hard_mask] = sub_labels_shifted
 
     # 2. Learning waves (spatial propagation of speed)
     edge_index, edge_weight = build_spatial_graph(coords, k=k_neighbours)
-    smoothed_speed = smooth_on_graph(field.speed_abs, edge_index, edge_weight, n_iter=2)
-    wave_metric = (field.speed_abs - smoothed_speed).astype(np.float32)
+    smoothed_speed = smooth_on_graph(field.learning_speed, edge_index, edge_weight, n_iter=2)
+    wave_metric = (field.learning_speed - smoothed_speed).astype(np.float32)
 
     # 3. Interface zones of late learning
     T_L_float = field.T_L.astype(np.float32)
@@ -142,7 +173,7 @@ def summarise_field(field: SpatialDynamicsField) -> Dict[str, float]:
     stats = {
         "mean_D_bar": float(field.D_bar.mean()),
         "frac_persistent_hard": float((field.D_bar > 0.75).mean()),
-        "mean_learning_speed": float(field.speed_abs.mean()),
+        "mean_learning_speed": float(field.learning_speed.mean()),
         "mean_volatility": float(field.volatility.mean()),
         "mean_T_L_epochs": float(field.T_L.mean()),
         "frac_never_learned": float((field.T_L == field.T).mean()),
