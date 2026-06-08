@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from typing import Dict
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
-
-from ..utils import build_spatial_graph, normalise_difficulty, smooth_on_graph
-from ..analysis.analysis import DifficultyDynamics
+import hdbscan
+from .utils import build_spatial_graph, normalise_difficulty, smooth_on_graph
+from .analysis import DifficultyDynamics
+from .difficulty_gse import gse_difficulty_from_field
 
 
 @dataclass
@@ -32,7 +33,7 @@ class SpatialDynamicsField:
     volatility: np.ndarray
     T_L: np.ndarray
     coords: np.ndarray
-
+    
     difficulty_score: np.ndarray
     
     @property
@@ -40,7 +41,7 @@ class SpatialDynamicsField:
         return self.D_field.shape[0]
 
     @property
-    def N(self) -> int:
+    def N(self) -> int: # number of spots
         return self.D_field.shape[1]
 
     def snapshot(self, epoch: int) -> np.ndarray:
@@ -103,6 +104,10 @@ def build_dynamics_field(
     speed_n = normalize(learning_speed)
 
     difficulty_score = (0.40 * D_bar_n+ 0.25 * TL_n+ 0.20 * vol_n- 0.15 * speed_n)
+    print(np.percentile(
+    D_field.flatten(),
+    [1,5,10,25,50]
+))
     
     return SpatialDynamicsField(
         D_field=D_field,
@@ -141,7 +146,7 @@ def analyse_topology(
     coords = field.coords
 
     # 1. Clusters of persistent hardness
-    hard_mask = field.D_bar > np.median(field.D_bar)
+    hard_mask = field.difficulty_score > np.median(field.difficulty_score)
     cluster_labels = np.full(N, -1, dtype=np.int32)
     if hard_mask.sum() > dbscan_min_samples:
         hard_coords = coords[hard_mask]
@@ -172,7 +177,7 @@ def summarise_field(field: SpatialDynamicsField) -> Dict[str, float]:
     """Print and return summary statistics of the dynamic field."""
     stats = {
         "mean_D_bar": float(field.D_bar.mean()),
-        "frac_persistent_hard": float((field.D_bar > 0.75).mean()),
+        "frac_persistent_hard": float((field.difficulty_score > 0.75).mean()),
         "mean_learning_speed": float(field.learning_speed.mean()),
         "mean_volatility": float(field.volatility.mean()),
         "mean_T_L_epochs": float(field.T_L.mean()),
@@ -183,23 +188,19 @@ def summarise_field(field: SpatialDynamicsField) -> Dict[str, float]:
     return stats
 
 
-def run_phase3(
+def build_difficulty_field(
     dynamics: DifficultyDynamics,
     learn_threshold: float = 0.3,
     k_neighbours: int = 6,
     dbscan_eps: float = 50.0,
     interface_percentile: float = 80.0,
 ) -> Dict[str, object]:
-    """
-    End-to-end Phase 3 runner.
-
-    Returns
-    -------
-    dict with keys: field, topology, stats
-    """
+   
     print("[Phase 3] Building dynamic spatial difficulty field D(x,y,t)...")
     field = build_dynamics_field(dynamics, learn_threshold=learn_threshold)
-
+    field.difficulty_score = gse_difficulty_from_field(
+        field, k=6, alpha=0.5
+    )
     print("[Phase 3] Summary statistics:")
     stats = summarise_field(field)
 

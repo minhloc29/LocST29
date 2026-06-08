@@ -19,7 +19,7 @@ class Phase1Results:
     adata_path: str
     morans_I: float
     morans_p: float
-
+    
 
 def build_spatial_graph(coords: np.ndarray, k: int = 6) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -237,7 +237,7 @@ def move_to_device(x, device: torch.device):
     return x.to(device)
 
 
-def flatten_indices(idx) -> torch.Tensor:
+def flatten_indices(idx) -> torch.Tensor: # turn to 1D tensor [[1, 2], [3, 4]] -> [1, 2, 3, 4]
     if torch.is_tensor(idx):
         return idx.view(-1)
     return torch.as_tensor(idx).view(-1)
@@ -312,38 +312,18 @@ def calc_adj(coord, k: int = 8, distance_type: str = "euclidean", prune_tag: str
     return adj
 
 
-
-
-class EarlyStopping:
-    def __init__(
-        self,
-        patience=20,
-        min_delta=1e-4,
-    ):
-        self.patience = patience
-        self.min_delta = min_delta
-
-        self.best_loss = float("inf")
-        self.counter = 0
-
-        self.best_state = None
-
-    def step(self, val_loss, model):
-        improved = (
-            self.best_loss - val_loss
-        ) > self.min_delta
-
-        if improved:
-            self.best_loss = val_loss
-            self.counter = 0
-
-            self.best_state = {
-                k: v.cpu().clone()
-                for k, v in model.state_dict().items()
-            }
-
-            return False
-
-        self.counter += 1
-
-        return self.counter >= self.patience
+    
+def _seed_everything(seed: int) -> None:
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        
+        
+def _make_seeded_generator(seed: int) -> torch.Generator:
+    """Pass to DataLoader(generator=...) for reproducible batch order."""
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return g

@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+import numpy as np
+from scipy.sparse import csr_matrix, diags
+from sklearn.neighbors import NearestNeighbors
+
+
+# ---------------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------------
+
+def build_spatial_adjacency(
+    coords: np.ndarray,
+    k: int = 6,
+    weight: str = "binary",   # "binary" | "distance" | "gaussian"
+    sigma: float = 1.0,
+) -> csr_matrix:
+    """
+    Build a sparse k-NN adjacency matrix from 2D spot coordinates.
+
+    Parameters
+    ----------
+    coords  : (N, 2) pixel coordinates
+    k       : number of nearest neighbours
+    weight  : edge weighting scheme
+                "binary"   → 1 for all edges
+                "distance" → 1 / (dist + 1e-8)
+                "gaussian" → exp(-dist² / (2σ²))
+    sigma   : bandwidth for gaussian weights (in same units as coords)
+
+    Returns
+    -------
+    A : (N, N) symmetric sparse adjacency matrix
+    """
+    N = coords.shape[0]
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(coords)
+    distances, indices = nbrs.kneighbors(coords)
+
+    rows, cols, vals = [], [], []
+    for i in range(N):
+        for j_pos in range(1, k + 1):          # skip self (index 0)
+            j   = indices[i, j_pos]
+            d   = distances[i, j_pos]
+
+            if weight == "binary":
+                w = 1.0
+            elif weight == "distance":
+                w = 1.0 / (d + 1e-8)
+            else:                               # gaussian
+                w = float(np.exp(-(d ** 2) / (2 * sigma ** 2 + 1e-10)))
+
+            rows.append(i); cols.append(j); vals.append(w)
+            rows.append(j); cols.append(i); vals.append(w)   # symmetrise
+
+    A = csr_matrix((vals, (rows, cols)), shape=(N, N))
+    return A
+
+
+def graph_laplacian(A: csr_matrix) -> csr_matrix:
+    """
+    Unnormalized graph Laplacian  L = D - A
+    where D is the diagonal degree matrix.
+    """
+    degree = np.asarray(A.sum(axis=1)).ravel()
+    D = diags(degree)
+    return D - A
+
+
+# ---------------------------------------------------------------------------
+# Graph Signal Energy difficulty
+# ---------------------------------------------------------------------------
+
+def graph_signal_energy_difficulty(
+    base_score: np.ndarray,
+    coords: np.ndarray,
+    k: int = 6,
+    alpha: float = 0.5,
+    weight: str = "binary",
+    sigma: float = 1.0,
+) -> np.ndarray:
+    """
+    Topology-aware difficulty via Graph Signal Energy (GSE).
+
+    Algorithm
+    ---------
+    1. Build k-NN spatial graph → adjacency A → Laplacian L = D - A
+    2. Apply Laplacian to base difficulty:  s = L @ base_score
+    3. Local energy:                        e_i = |s_i|
+       High e_i ↔ spot sits at a sharp boundary in difficulty space.
+    4. Combine:
+       d_i = α · normalize(base_score_i) + (1-α) · normalize(e_i)
+
+    Parameters
+    ----------
+    base_score : (N,) existing difficulty estimate (e.g. your D_bar-based score)
+    coords     : (N, 2) pixel coordinates
+    k          : spatial graph neighbours
+    alpha      : weight for base score vs local energy
+                 0 → pure topology (boundary-only)
+                 1 → pure base score (ignores graph)
+                 0.5 → balanced (recommended)
+    weight     : adjacency weighting ("binary", "distance", "gaussian")
+    sigma      : gaussian bandwidth (pixels)
+
+    Returns
+    -------
+    gse_difficulty : (N,) array in [0, 1], higher = harder
+    """
+    base_score = np.asarray(base_score, dtype=np.float64)
+    N = len(base_score)
+
+    # 1. Graph + Laplacian
+    A = build_spatial_adjacency(coords, k=k, weight=weight, sigma=sigma)
+    L = graph_laplacian(A)
+
+    # 2. Graph signal: apply Laplacian to base difficulty
+    s = L @ base_score                    # (N,) — signed local variation
+
+    # 3. Local energy: magnitude of Laplacian response
+    e = np.abs(s)                         # (N,) — boundary sharpness
+
+    # 4. Normalize both components to [0, 1]
+    def _norm(x: np.ndarray) -> np.ndarray:
+        lo, hi = x.min(), x.max()
+        if hi - lo < 1e-10:
+            return np.zeros_like(x, dtype=np.float32)
+        return ((x - lo) / (hi - lo)).astype(np.float32)
+
+    base_n  = _norm(base_score)
+    energy_n = _norm(e)
+
+    # 5. Combine
+    gse_difficulty = alpha * base_n + (1.0 - alpha) * energy_n
+
+    return gse_difficulty.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Drop-in replacement that takes a SpatialDynamicsField
+# ---------------------------------------------------------------------------
+
+def gse_difficulty_from_field(
+    field,                    # SpatialDynamicsField
+    k: int = 6,
+    alpha: float = 0.5,
+    weight: str = "binary",
+    sigma: float = 1.0,
+) -> np.ndarray:
+    """
+    Convenience wrapper: compute GSE difficulty directly from a
+    SpatialDynamicsField, using field.difficulty_score as the base.
+
+    Returns
+    -------
+    gse_score : (N,) array, same shape as field.difficulty_score
+    """
+    return graph_signal_energy_difficulty(
+        base_score=field.difficulty_score,
+        coords=field.coords,
+        k=k,
+        alpha=alpha,
+        weight=weight,
+        sigma=sigma,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Utility: compare both scores side by side
+# ---------------------------------------------------------------------------
+
+def compare_difficulty_scores(
+    field,
+    k: int = 6,
+    alpha: float = 0.5,
+) -> dict:
+    """
+    Compute both original and GSE difficulty scores and return summary stats.
+    Useful for diagnosing how much topology changes the ordering.
+
+    Returns
+    -------
+    dict with keys:
+        original  : (N,) original difficulty_score
+        gse       : (N,) GSE difficulty score
+        rank_corr : Spearman rank correlation between the two
+        top25_overlap : fraction of top-25% hard spots shared by both
+    """
+    from scipy.stats import spearmanr
+
+    orig = np.asarray(field.difficulty_score, dtype=np.float32)
+    gse  = gse_difficulty_from_field(field, k=k, alpha=alpha)
+
+    rho, _ = spearmanr(orig, gse)
+
+    N = len(orig)
+    n_top = max(1, N // 4)
+    top_orig = set(np.argsort(orig)[-n_top:])
+    top_gse  = set(np.argsort(gse)[-n_top:])
+    overlap  = len(top_orig & top_gse) / n_top
+
+    print(f"[GSE] N={N} | alpha={alpha} | k={k}")
+    print(f"  Spearman rank corr (orig vs GSE): {rho:.3f}")
+    print(f"  Top-25% hard spots overlap:       {overlap:.1%}")
+    print(f"  GSE  mean={gse.mean():.3f}  std={gse.std():.3f}")
+    print(f"  Orig mean={orig.mean():.3f}  std={orig.std():.3f}")
+
+    return {
+        "original":       orig,
+        "gse":            gse,
+        "rank_corr":      float(rho),
+        "top25_overlap":  float(overlap),
+    }

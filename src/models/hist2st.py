@@ -34,7 +34,7 @@ def _random_rotation(x, degrees: float = 90.0):
 
     theta = torch.zeros((n, 2, 3), device=x.device, dtype=x.dtype)
     theta[:, 0, 0] = cos
-    theta[:, 0, 1] = -sin
+    theta[:, 0, 1]  = -sin
     theta[:, 1, 0] = sin
     theta[:, 1, 1] = cos
 
@@ -53,6 +53,8 @@ class ConvmixerBlock(nn.Module):
     def __init__(self, dim, kernel_size):
         super().__init__()
         self.dw = nn.Sequential(
+            
+            # the input dim of Conv2d must match the last C of (B, C, H, W)
             nn.Conv2d(dim, dim, kernel_size, groups=dim, padding="same"),
             nn.BatchNorm2d(dim),
             nn.GELU(),
@@ -67,6 +69,10 @@ class ConvmixerBlock(nn.Module):
         )
 
     def forward(self, x):
+        '''
+            x: (B, C, H, W)
+        '''
+        
         x = self.dw(x) + x
         x = self.pw(x)
         return x

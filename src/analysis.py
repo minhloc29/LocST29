@@ -6,8 +6,8 @@ import numpy as np
 import torch
 import anndata as ad
 
-from ..utils import Phase1Results, build_spatial_graph, normalise_difficulty, smooth_on_graph
-from ..utils import move_to_device, flatten_indices
+from .utils import Phase1Results, build_spatial_graph, normalise_difficulty, smooth_on_graph
+from .utils import move_to_device, flatten_indices
 
 
 @dataclass
@@ -104,16 +104,14 @@ def _spatial_gradient(values: np.ndarray, coords: np.ndarray, k: int) -> np.ndar
     return (values - local_mean).astype(np.float32)
 
 
-def run_phase2(
+def run_difficulty_analysis(
     p1: Phase1Results,
     adata: ad.AnnData,
     dynamics: Optional[DifficultyDynamics] = None,
     k_neighbours: int = 6,
     n_clusters: int = 4,
 ) -> Dict[str, object]:
-    """
-    Compute static difficulty factors and attach optional dynamics.
-    """
+    
     _ = n_clusters  # reserved for future clustering extensions
 
     exp = adata.X

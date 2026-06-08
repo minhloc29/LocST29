@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
 from scipy.stats import pearsonr
 
-from .dynamics.dynamics import SpatialDynamicsField
-from .curriculum.curriculum import TrainingLog
+from .dynamics import SpatialDynamicsField
+from .curriculum import TrainingLog
 from .utils import move_to_device, flatten_indices
 from .utils import prepare_morans_adata, morans_i_scanpy_from_adata
 
@@ -131,7 +131,7 @@ def boundary_hard_evaluation(
     percentile: float = 75.0,
 ) -> Dict[str, float]:
     
-    hard_mask = field.D_bar > np.percentile(field.D_bar, percentile)
+    hard_mask = field.difficulty_score > np.percentile(field.difficulty_score, percentile)
 
     curr_metrics = per_region_metrics(pred_curriculum, target, hard_mask, "Curriculum_Hard")
     base_metrics = per_region_metrics(pred_baseline, target, hard_mask, "Baseline_Hard")
@@ -173,7 +173,7 @@ def biological_overlap(
     For each biological structure, compute Jaccard overlap with the top
     percentile hardest spots.
     """
-    hard_mask = field.D_bar > np.percentile(field.D_bar, percentile)
+    hard_mask = field.difficulty_score > np.percentile(field.difficulty_score, percentile)
     results = {}
     for name, bio_mask in bio.available().items():
         intersection = (hard_mask & bio_mask).sum()
@@ -354,7 +354,7 @@ def reorder_by_spot(
     return out
 
 
-def run_phase5(
+def run_evaluation(
     curriculum_model: nn.Module,
     baseline_model: nn.Module,
     test_loader,

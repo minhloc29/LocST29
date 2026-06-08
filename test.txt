@@ -1,0 +1,8 @@
+python train.py --dataset her2st --model-module src.models.cnn --model-class CNNBaseline --batch-size 8 --fold 8 --total-epochs 400 --device cuda --output-dir ./run/run2
+
+
+
+python train.py --dataset her2st --model-module src.models.hist2st --model-class Hist2ST --batch-size 8 --fold 1 --total-epochs 400 --device cuda
+
+
+python train.py --config config/config.yaml

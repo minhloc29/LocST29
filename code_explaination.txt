@@ -1,0 +1,71 @@
+for x, y, idx in loader:
+    x = move_to_device(x, device)
+
+    with torch.no_grad():
+        pred = model(x).detach().cpu().numpy()
+
+    target = y.detach().cpu().numpy()
+    idx_flat = flatten_indices(idx).cpu().numpy()
+
+
+with torch.no_grad():
+Disable gradient computation.
+Used during inference/evaluation.
+Saves memory.
+Speeds up execution.
+
+Mathematically:
+
+∂θ
+∂L
+	​
+
+
+is not computed.
+
+pred = model(x)
+Forward pass through the model.
+y
+^
+	​
+
+=f
+θ
+	​
+
+(x)
+Produces predictions.
+.detach()
+Disconnect tensor from computation graph.
+No gradients can flow through it.
+
+Before:
+
+x → model → pred
+
+After detach:
+
+pred
+
+becomes independent.
+
+.cpu()
+Move tensor from GPU to CPU.
+NumPy only works with CPU memory.
+.numpy()
+Convert PyTorch tensor to NumPy array.
+tensor([1,2,3])
+
+↓
+
+array([1,2,3])
+
+Useful for:
+
+scipy
+pandas
+plotting
+statistics
+target = y.detach().cpu().numpy()
+Convert ground-truth labels to NumPy.
+detach() usually unnecessary because y normally has no gradients.

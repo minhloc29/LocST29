@@ -18,6 +18,7 @@ from scipy.spatial import distance
 
 from .utils import Phase1Results, prepare_morans_adata, morans_i_scanpy_from_adata
 from .utils import move_to_device, flatten_indices, _resolve_data_root, _require_dir, calc_adj
+from .analysis import DifficultyFactors
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
@@ -417,6 +418,20 @@ class SpatialModelAdapter(torch.nn.Module):
         return output
 
 
+class MultiSlideAdapter(Dataset):
+    def __init__(self, base_dataset):
+        self.base = base_dataset
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        data = self.base[idx]
+        patches, positions, exp, adj = data[0], data[1], data[2], data[3]
+        spot_idx = torch.arange(exp.shape[0], dtype=torch.long)
+        return (patches, positions, adj), exp, spot_idx, idx
+    
+        
 class SingleSlideAdapter(Dataset):
     """Expose a single slide as (x, y, spot_index)."""
 
