@@ -4,10 +4,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple
-from scipy.stats import pearsonr
+from typing import List, Optional, Dict, Tuple
+from scipy.stats import pearsonr, spearmanr
 
-from .dynamics import SpatialDynamicsField
+from .dynamics import SpatialDynamicsField, TopologyResult
 from .curriculum import TrainingLog
 from .utils import move_to_device, flatten_indices
 from .utils import prepare_morans_adata, morans_i_scanpy_from_adata
@@ -184,6 +184,334 @@ def biological_overlap(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Paper Metrics — dataclasses and functions for RQ1–RQ4
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DifficultyBinReport:
+    """Per-bin metrics for both curriculum and baseline models."""
+    bin_label: str
+    n_spots: int
+    curriculum_mse: float
+    baseline_mse: float
+    curriculum_pcc: float
+    baseline_pcc: float
+    mse_gain: float        # baseline - curriculum  (positive = curriculum better)
+    pcc_gain: float        # curriculum - baseline
+
+
+@dataclass
+class PaperMetricsReport:
+    """
+    Paper-ready metrics organised by research question (RQ1–RQ4).
+    All fields are plain Python types for easy JSON serialization.
+    """
+    # RQ1: Can training dynamics reveal spatial difficulty?
+    difficulty_error_pearson: float = 0.0
+    difficulty_error_spearman: float = 0.0
+    difficulty_bins: List[DifficultyBinReport] = field(default_factory=list)
+
+    # RQ2: What biological regions are difficult?
+    interface_curriculum_mse: float = 0.0
+    interface_baseline_mse: float = 0.0
+    interface_curriculum_pcc: float = 0.0
+    interface_baseline_pcc: float = 0.0
+    n_interface_spots: int = 0
+    cluster_metrics: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    # RQ3: Does curriculum improve learning?
+    aulc_curriculum: float = 0.0
+    aulc_baseline: float = 0.0
+    time_to_target_curriculum: int = -1
+    time_to_target_baseline: int = -1
+
+    # RQ4: Does curriculum help difficult regions?
+    hard_bin_improvement_mse: float = 0.0
+    hard_bin_improvement_pcc: float = 0.0
+    overall_improvement_mse: float = 0.0
+    overall_improvement_pcc: float = 0.0
+
+    def print_rq1(self) -> None:
+        print("\n" + "=" * 60)
+        print("RQ1: Can Training Dynamics Reveal Spatial Difficulty?")
+        print("=" * 60)
+        print(f"  Difficulty-Error Correlation:")
+        print(f"    Pearson r  = {self.difficulty_error_pearson:.4f}")
+        print(f"    Spearman ρ = {self.difficulty_error_spearman:.4f}")
+        print(f"\n  Difficulty Bin Performance (Curriculum):")
+        print(f"  {'Bin':<20} {'N':>6} {'MSE':>10} {'PCC':>8}")
+        print(f"  {'-' * 46}")
+        for bin_rep in self.difficulty_bins:
+            print(f"  {bin_rep.bin_label:<20} {bin_rep.n_spots:>6} "
+                  f"{bin_rep.curriculum_mse:>10.4f} {bin_rep.curriculum_pcc:>8.4f}")
+
+    def print_rq2(self) -> None:
+        print("\n" + "=" * 60)
+        print("RQ2: What Biological Regions Are Difficult?")
+        print("=" * 60)
+        if self.n_interface_spots > 0:
+            print(f"  Interface Zone (n={self.n_interface_spots} spots):")
+            print(f"    {'Metric':<20} {'Curriculum':>12} {'Baseline':>12} {'Delta':>10}")
+            print(f"    {'-' * 56}")
+            delta_mse = self.interface_baseline_mse - self.interface_curriculum_mse
+            delta_pcc = self.interface_curriculum_pcc - self.interface_baseline_pcc
+            print(f"    {'MSE':<20} {self.interface_curriculum_mse:>12.4f} "
+                  f"{self.interface_baseline_mse:>12.4f} {delta_mse:>+10.4f}")
+            print(f"    {'PCC':<20} {self.interface_curriculum_pcc:>12.4f} "
+                  f"{self.interface_baseline_pcc:>12.4f} {delta_pcc:>+10.4f}")
+        else:
+            print("  No interface-zone spots identified.")
+        if self.cluster_metrics:
+            print(f"\n  Persistent Hard Clusters:")
+            for cid, cm in sorted(self.cluster_metrics.items()):
+                print(f"    Cluster {cid}: n={cm.get('n_spots', '?')} "
+                      f"MSE(curr={cm.get('curriculum_mse', 0):.4f}, "
+                      f"base={cm.get('baseline_mse', 0):.4f}) "
+                      f"PCC(curr={cm.get('curriculum_pcc', 0):.4f}, "
+                      f"base={cm.get('baseline_pcc', 0):.4f})")
+
+    def print_rq3(self) -> None:
+        print("\n" + "=" * 60)
+        print("RQ3: Does Curriculum Improve Learning?")
+        print("=" * 60)
+        print(f"  {'Metric':<30} {'Curriculum':>12} {'Baseline':>12} {'Delta':>10}")
+        print(f"  {'-' * 66}")
+        delta_aulc = self.aulc_curriculum - self.aulc_baseline
+        print(f"  {'AULC (val_loss)':<30} {self.aulc_curriculum:>12.4f} "
+              f"{self.aulc_baseline:>12.4f} {delta_aulc:>+10.4f}")
+        ttc = f"Epoch {self.time_to_target_curriculum}" if self.time_to_target_curriculum >= 0 else "N/A"
+        ttb = f"Epoch {self.time_to_target_baseline}" if self.time_to_target_baseline >= 0 else "N/A"
+        print(f"  {'Time-to-target (PCC>=thresh)':<30} {ttc:>12} {ttb:>12}")
+
+    def print_rq4(self) -> None:
+        print("\n" + "=" * 60)
+        print("RQ4: Does Curriculum Help Difficult Regions?")
+        print("=" * 60)
+        print(f"  {'Bin':<20} {'N':>6} {'Curr MSE':>10} {'Base MSE':>10} "
+              f"{'Δ MSE':>10} {'Δ PCC':>8}")
+        print(f"  {'-' * 66}")
+        for bin_rep in self.difficulty_bins:
+            print(f"  {bin_rep.bin_label:<20} {bin_rep.n_spots:>6} "
+                  f"{bin_rep.curriculum_mse:>10.4f} {bin_rep.baseline_mse:>10.4f} "
+                  f"{bin_rep.mse_gain:>+10.4f} {bin_rep.pcc_gain:>+8.4f}")
+        print(f"\n  Summary:")
+        print(f"    Hardest bin MSE improvement: {self.hard_bin_improvement_mse:+.4f}")
+        print(f"    Hardest bin PCC improvement: {self.hard_bin_improvement_pcc:+.4f}")
+        print(f"    Overall MSE improvement:     {self.overall_improvement_mse:+.4f}")
+        print(f"    Overall PCC improvement:     {self.overall_improvement_pcc:+.4f}")
+
+    def print_all(self) -> None:
+        self.print_rq1()
+        self.print_rq2()
+        self.print_rq3()
+        self.print_rq4()
+
+
+# ---------------------------------------------------------------------------
+# Paper Metric Computation Functions
+# ---------------------------------------------------------------------------
+
+def difficulty_error_correlation(
+    difficulty_score: np.ndarray,
+    per_spot_error: np.ndarray,
+) -> Tuple[float, float]:
+    """
+    Pearson and Spearman correlation between difficulty_score and per-spot error.
+
+    Parameters
+    ----------
+    difficulty_score : (N,)  composite difficulty in [0, 1]
+    per_spot_error   : (N,)  per-spot MSE across genes
+
+    Returns
+    -------
+    pearson_r  : float
+    spearman_rho : float
+    """
+    r_pearson, _ = pearsonr(difficulty_score, per_spot_error)
+    r_spearman, _ = spearmanr(difficulty_score, per_spot_error)
+    return float(r_pearson), float(r_spearman)
+
+
+def compute_difficulty_bins(
+    difficulty_score: np.ndarray,
+    pred_curriculum: np.ndarray,
+    pred_baseline: np.ndarray,
+    target: np.ndarray,
+    n_bins: int = 5,
+) -> List[DifficultyBinReport]:
+    """
+    Partition spots into n_bins quantile groups by difficulty (ascending).
+
+    Returns a DifficultyBinReport for each bin, where bin 0 = easiest, bin N = hardest.
+    """
+    N = len(difficulty_score)
+    sorted_idx = np.argsort(difficulty_score)  # easiest first
+    bin_size = N // n_bins
+    default_labels = ["Easiest 20%", "20-40%", "40-60%", "60-80%", "Hardest 20%"]
+    reports = []
+    for i in range(n_bins):
+        start = i * bin_size
+        end = N if i == n_bins - 1 else start + bin_size
+        bin_idx = sorted_idx[start:end]
+        c_pred = pred_curriculum[bin_idx]
+        b_pred = pred_baseline[bin_idx]
+        tgt = target[bin_idx]
+        cm = mse(c_pred, tgt)
+        bm = mse(b_pred, tgt)
+        cp = pearson_correlation_coefficient(c_pred, tgt)
+        bp = pearson_correlation_coefficient(b_pred, tgt)
+        reports.append(DifficultyBinReport(
+            bin_label=default_labels[i] if i < len(default_labels) else f"Bin {i+1}",
+            n_spots=len(bin_idx),
+            curriculum_mse=cm,
+            baseline_mse=bm,
+            curriculum_pcc=cp,
+            baseline_pcc=bp,
+            mse_gain=bm - cm,
+            pcc_gain=cp - bp,
+        ))
+    return reports
+
+
+def compute_aulc(val_losses: List[float]) -> float:
+    """Area Under the Loss Curve via trapezoidal integration."""
+    losses = np.asarray(val_losses)
+    if len(losses) < 2:
+        return float("nan")
+    return float(np.trapz(losses))
+
+
+def time_to_target_pcc(
+    epoch_pccs: List[float],
+    threshold: float = 0.45,
+) -> int:
+    """First epoch index where PCC >= threshold. Returns -1 if never reached."""
+    for i, pcc_val in enumerate(epoch_pccs):
+        if pcc_val >= threshold:
+            return i
+    return -1
+
+
+def evaluate_interface_zone(
+    pred_curriculum: np.ndarray,
+    pred_baseline: np.ndarray,
+    target: np.ndarray,
+    interface_mask: np.ndarray,
+) -> Dict[str, float]:
+    """Evaluate both models on interface-zone spots."""
+    if interface_mask.sum() == 0:
+        return {"interface_n_spots": 0}
+    c_pred = pred_curriculum[interface_mask]
+    b_pred = pred_baseline[interface_mask]
+    tgt = target[interface_mask]
+    return {
+        "interface_n_spots": int(interface_mask.sum()),
+        "interface_curriculum_mse": mse(c_pred, tgt),
+        "interface_baseline_mse": mse(b_pred, tgt),
+        "interface_curriculum_pcc": pearson_correlation_coefficient(c_pred, tgt),
+        "interface_baseline_pcc": pearson_correlation_coefficient(b_pred, tgt),
+    }
+
+
+def evaluate_clusters(
+    pred_curriculum: np.ndarray,
+    pred_baseline: np.ndarray,
+    target: np.ndarray,
+    cluster_labels: np.ndarray,
+) -> Dict[str, Dict[str, float]]:
+    """Per-DBSCAN-cluster MSE/PCC for both models."""
+    unique = set(cluster_labels[cluster_labels >= 0])
+    results = {}
+    for cid in sorted(unique):
+        mask = cluster_labels == cid
+        c_pred = pred_curriculum[mask]
+        b_pred = pred_baseline[mask]
+        tgt = target[mask]
+        results[str(cid)] = {
+            "n_spots": int(mask.sum()),
+            "curriculum_mse": mse(c_pred, tgt),
+            "baseline_mse": mse(b_pred, tgt),
+            "curriculum_pcc": pearson_correlation_coefficient(c_pred, tgt),
+            "baseline_pcc": pearson_correlation_coefficient(b_pred, tgt),
+        }
+    return results
+
+
+def compute_paper_metrics(
+    pred_curriculum: np.ndarray,
+    pred_baseline: np.ndarray,
+    target: np.ndarray,
+    field: SpatialDynamicsField,
+    topology: Optional[TopologyResult] = None,
+    training_log_curriculum: Optional[TrainingLog] = None,
+    epoch_pccs_curriculum: Optional[List[float]] = None,
+    training_log_baseline: Optional[TrainingLog] = None,
+    epoch_pccs_baseline: Optional[List[float]] = None,
+    n_bins: int = 5,
+    pcc_threshold: float = 0.45,
+) -> PaperMetricsReport:
+    """
+    Compute all paper metrics (RQ1–RQ4) from predictions and dynamics data.
+    """
+    # --- RQ1 ---
+    per_spot_error = compute_error_vector(pred_curriculum, target)
+    r_pearson, r_spearman = difficulty_error_correlation(
+        field.difficulty_score, per_spot_error
+    )
+    bins = compute_difficulty_bins(
+        field.difficulty_score, pred_curriculum, pred_baseline, target, n_bins=n_bins
+    )
+
+    report = PaperMetricsReport(
+        difficulty_error_pearson=r_pearson,
+        difficulty_error_spearman=r_spearman,
+        difficulty_bins=bins,
+    )
+
+    # --- RQ2 ---
+    if topology is not None:
+        im = evaluate_interface_zone(
+            pred_curriculum, pred_baseline, target, topology.interface_mask
+        )
+        report.interface_curriculum_mse = im.get("interface_curriculum_mse", 0.0)
+        report.interface_baseline_mse = im.get("interface_baseline_mse", 0.0)
+        report.interface_curriculum_pcc = im.get("interface_curriculum_pcc", 0.0)
+        report.interface_baseline_pcc = im.get("interface_baseline_pcc", 0.0)
+        report.n_interface_spots = im.get("interface_n_spots", 0)
+        report.cluster_metrics = evaluate_clusters(
+            pred_curriculum, pred_baseline, target, topology.persistent_clusters
+        )
+
+    # --- RQ3 ---
+    if training_log_curriculum is not None and len(training_log_curriculum.val_loss) > 0:
+        report.aulc_curriculum = compute_aulc(training_log_curriculum.val_loss)
+    if training_log_baseline is not None and len(training_log_baseline.val_loss) > 0:
+        report.aulc_baseline = compute_aulc(training_log_baseline.val_loss)
+    if epoch_pccs_curriculum is not None:
+        report.time_to_target_curriculum = time_to_target_pcc(
+            epoch_pccs_curriculum, threshold=pcc_threshold
+        )
+    if epoch_pccs_baseline is not None:
+        report.time_to_target_baseline = time_to_target_pcc(
+            epoch_pccs_baseline, threshold=pcc_threshold
+        )
+
+    # --- RQ4 ---
+    if bins:
+        hardest = bins[-1]
+        report.hard_bin_improvement_mse = hardest.mse_gain
+        report.hard_bin_improvement_pcc = hardest.pcc_gain
+    report.overall_improvement_mse = mse(pred_baseline, target) - mse(pred_curriculum, target)
+    report.overall_improvement_pcc = (
+        pearson_correlation_coefficient(pred_curriculum, target)
+        - pearson_correlation_coefficient(pred_baseline, target)
+    )
+
+    return report
+
+
 @dataclass
 class EvaluationReport:
     """Full Phase 5 evaluation report."""
@@ -198,6 +526,7 @@ class EvaluationReport:
     hard_region_metrics: Dict[str, float] = field(default_factory=dict)
     biological_overlaps: Dict[str, float] = field(default_factory=dict)
     spatial_error_autocorr: Optional["SpatialAutocorrReport"] = None
+    paper_metrics: Optional[PaperMetricsReport] = None
 
     def print_summary(self) -> None:
         print("\n" + "=" * 60)
@@ -234,6 +563,9 @@ class EvaluationReport:
                 f"[min {r.random_min:.4f}, max {r.random_max:.4f}]"
             )
             print(f"   Percentile vs random: {r.random_percentile:.1f}th")
+        if self.paper_metrics is not None:
+            print("\n5. PAPER METRICS (RQ1–RQ4)")
+            self.paper_metrics.print_all()
         print("=" * 60 + "\n")
 
 
@@ -367,8 +699,13 @@ def run_evaluation(
     k_neighbours: int = 8,
     n_perm: int = 999,
     n_shuffles: int = 100,
+    topology: Optional[TopologyResult] = None,
+    training_log_baseline: Optional[TrainingLog] = None,
+    epoch_pccs_curriculum: Optional[List[float]] = None,
+    epoch_pccs_baseline: Optional[List[float]] = None,
+    pcc_threshold: float = 0.45,
 ) -> EvaluationReport:
-    
+
     N = field.N
     print("[Phase 5] Running inference on curriculum model...")
     cp, ct, ci = predict_all(curriculum_model, test_loader, device)
@@ -413,6 +750,20 @@ def run_evaluation(
             n_perm=n_perm,
             n_shuffles=n_shuffles,
         )
+
+    print("[Phase 5] Computing paper metrics (RQ1–RQ4)...")
+    report.paper_metrics = compute_paper_metrics(
+        pred_curriculum=cp,
+        pred_baseline=bp,
+        target=ct,
+        field=field,
+        topology=topology,
+        training_log_curriculum=training_log,
+        epoch_pccs_curriculum=epoch_pccs_curriculum,
+        training_log_baseline=training_log_baseline,
+        epoch_pccs_baseline=epoch_pccs_baseline,
+        pcc_threshold=pcc_threshold,
+    )
 
     report.print_summary()
     return report

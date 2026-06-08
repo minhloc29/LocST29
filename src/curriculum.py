@@ -89,13 +89,16 @@ class TopologyAwareCurriculumSampler:
 class TrainingLog:
     train_loss: List[float] = field(default_factory=list)
     val_loss: List[float] = field(default_factory=list)
+    val_pcc: List[float] = field(default_factory=list)
     tau_history: List[float] = field(default_factory=list)
     mask_sizes: List[int] = field(default_factory=list)
     epoch_masks: List[np.ndarray] = field(default_factory=list)
 
-    def log(self, train: float, val: float, tau: float, mask: np.ndarray) -> None:
+    def log(self, train: float, val: float, tau: float, mask: np.ndarray,
+            pcc: Optional[float] = None) -> None:
         self.train_loss.append(train)
         self.val_loss.append(val)
+        self.val_pcc.append(pcc if pcc is not None else float("nan"))
         self.tau_history.append(tau)
         self.mask_sizes.append(int(mask.sum()))
         self.epoch_masks.append(mask.copy())
@@ -187,6 +190,60 @@ def evaluate(
         total_n += y.shape[0]
 
     return total_loss / max(total_n, 1)
+
+
+@torch.no_grad()
+def evaluate_with_pcc(
+    model: nn.Module,
+    loader,
+    loss_fn: Callable,
+    device: torch.device,
+) -> Tuple[float, float]:
+    """
+    Evaluate model on loader and return both validation loss and spot-wise PCC.
+    PCC is averaged across spots (each spot is a gene expression vector).
+    """
+    model.eval()
+    total_loss, total_n = 0.0, 0
+    all_pred, all_target = [], []
+
+    for x, y, _ in loader:
+        x = move_to_device(x, device)
+        pred = model(x)
+        if isinstance(pred, tuple):
+            pred = pred[0]
+        y = y.to(device)
+        if y.ndim == 3 and y.shape[0] == 1:
+            y = y.squeeze(0)
+        if pred.ndim == 3 and pred.shape[0] == 1:
+            pred = pred.squeeze(0)
+
+        assert pred.shape == y.shape, f"pred={pred.shape}, target={y.shape}"
+        loss = loss_fn(pred, y)
+        total_loss += loss.item() * y.shape[0]
+        total_n += y.shape[0]
+        all_pred.append(pred.cpu().numpy())
+        all_target.append(y.cpu().numpy())
+
+    val_loss = total_loss / max(total_n, 1)
+
+    if all_pred:
+        pred_np = np.concatenate(all_pred, axis=0)
+        target_np = np.concatenate(all_target, axis=0)
+        # spot-wise PCC
+        from scipy.stats import pearsonr
+        pccs = []
+        for i in range(pred_np.shape[0]):
+            p, t = pred_np[i], target_np[i]
+            if t.std() < 1e-8 or p.std() < 1e-8:
+                continue
+            r, _ = pearsonr(p, t)
+            pccs.append(r)
+        val_pcc = float(np.nanmean(pccs)) if pccs else float("nan")
+    else:
+        val_pcc = float("nan")
+
+    return val_loss, val_pcc
 
 
 
@@ -338,11 +395,11 @@ def train_curriculum(
     )
 
     for epoch in range(total_epochs):
-        val_loss = evaluate(model, val_loader, loss_fn, device)
+        val_loss, val_pcc = evaluate_with_pcc(model, val_loader, loss_fn, device)
 
         if val_loss < best_val:
             best_val = val_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}    
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
         tau = scheduler.step(val_loss)
         mask = sampler.get_mask(tau)
@@ -353,12 +410,13 @@ def train_curriculum(
             max_grad_norm=cfg.training.max_grad_norm
         )
 
-        log.log(train_loss, val_loss, tau, mask)
+        log.log(train_loss, val_loss, tau, mask, pcc=val_pcc)
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
             print(
                 f"  Epoch {epoch + 1:3d}/{total_epochs} | "
                 f"train={train_loss:.4f} | val={val_loss:.4f} | "
+                f"PCC={val_pcc:.4f} | "
                 f"tau={tau:.3f} | active spots={mask.sum()}/{field.N} "
                 f"({100 * mask.mean():.1f}%)"
             )
