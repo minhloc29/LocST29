@@ -19,3 +19,18 @@ env/
 model/
 
 
+
+# checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# outputs
+runs/
+outputs/
+results/
+
+# logs
+wandb/
+logs/
+tensorboard/
