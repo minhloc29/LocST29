@@ -99,16 +99,11 @@ def build_dynamics_field(
         return (x - x.min()) / (x.max() - x.min() + 1e-8)
 
     D_bar_n = normalize(D_bar)
-    vol_n = normalize(volatility)
-    TL_n = normalize(T_L.astype(np.float32))
-    speed_n = normalize(learning_speed)
-
-    difficulty_score = (0.40 * D_bar_n+ 0.25 * TL_n+ 0.20 * vol_n- 0.15 * speed_n)
     print(np.percentile(
     D_field.flatten(),
     [1,5,10,25,50]
 ))
-    
+
     return SpatialDynamicsField(
         D_field=D_field,
         D_bar=D_bar,
@@ -117,7 +112,7 @@ def build_dynamics_field(
         volatility=volatility,
         T_L=T_L,
         coords=dynamics.coords,
-        difficulty_score=difficulty_score
+        difficulty_score=D_bar_n
     )
 
 

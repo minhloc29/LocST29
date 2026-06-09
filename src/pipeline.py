@@ -12,7 +12,7 @@ from .utils import Phase1Results, _seed_everything, _make_seeded_generator, move
 from .analysis import (
     DifficultyDynamics, EpochMSECallback, run_difficulty_analysis
 )
-from .dynamics import build_difficulty_field, SpatialDynamicsField
+from .dynamics import build_difficulty_field, SpatialDynamicsField, TopologyResult
 from .curriculum import (
     train_curriculum, TrainingLog,
     save_init_checkpoint, load_init_checkpoint, reset_optimizer,
