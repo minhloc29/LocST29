@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
 import hdbscan
 from .utils import build_spatial_graph, normalise_difficulty, smooth_on_graph
 from .analysis import DifficultyDynamics
-from .difficulty_gse import gse_difficulty_from_field
+from .difficulty_gse import gse_difficulty_from_field, topological_difficulty_from_data
 
 
 @dataclass
@@ -189,13 +189,23 @@ def build_difficulty_field(
     k_neighbours: int = 6,
     dbscan_eps: float = 50.0,
     interface_percentile: float = 80.0,
+    expression: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
-   
+
     print("[Phase 3] Building dynamic spatial difficulty field D(x,y,t)...")
     field = build_dynamics_field(dynamics, learn_threshold=learn_threshold)
-    field.difficulty_score = gse_difficulty_from_field(
-        field, k=6, alpha=0.5
-    )
+
+    if expression is not None:
+        field.difficulty_score = topological_difficulty_from_data(
+            expression=expression,
+            coords=field.coords,
+            k_neighbours=k_neighbours,
+        )
+    else:
+        field.difficulty_score = gse_difficulty_from_field(
+            field, k=6, alpha=0.5
+        )
+
     print("[Phase 3] Summary statistics:")
     stats = summarise_field(field)
 

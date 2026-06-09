@@ -274,6 +274,7 @@ class SpatialCurriculumPipeline:
             k_neighbours=self.cfg.difficulty.k_neighbours,
             dbscan_eps=self.cfg.difficulty.dbscan_eps,
             interface_percentile=self.cfg.difficulty.interface_pct,
+            expression=np.asarray(adata.X),
         )
         self._field = self.difficulty_field["field"]
         

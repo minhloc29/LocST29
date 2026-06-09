@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 from scipy.sparse import csr_matrix, diags
 from sklearn.neighbors import NearestNeighbors
@@ -210,3 +212,93 @@ def compare_difficulty_scores(
         "rank_corr":      float(rho),
         "top25_overlap":  float(overlap),
     }
+
+
+# ---------------------------------------------------------------------------
+# Topological difficulty from raw data (no training needed)
+# ---------------------------------------------------------------------------
+
+def topological_difficulty_from_data(
+    expression: np.ndarray,
+    coords: np.ndarray,
+    patches: Optional[np.ndarray] = None,
+    k_neighbours: int = 6,
+    alpha_expr: float = 0.4,
+    alpha_hist: float = 0.3,
+    alpha_spatial: float = 0.3,
+) -> np.ndarray:
+    """
+    Compute difficulty score directly from raw data using graph signal energy.
+
+    Difficulty captures three signals:
+    1. Expression heterogeneity (entropy per spot)
+    2. Histology heterogeneity (patch variance per spot)  [if patches provided]
+    3. Spatial discontinuity (graph Laplacian on features)
+
+    No training or warm-up needed.
+
+    Parameters
+    ----------
+    expression  : (N, G) log-normalized gene expression
+    coords      : (N, 2) spatial coordinates
+    patches     : (N, C, H, W) or (N, D) image patches, optional
+    k_neighbours : k for spatial graph
+    alpha_expr  : weight for expression heterogeneity
+    alpha_hist  : weight for histology heterogeneity (ignored if no patches)
+    alpha_spatial : weight for spatial discontinuity
+
+    Returns
+    -------
+    difficulty : (N,) array in [0, 1], higher = harder
+    """
+    N = coords.shape[0]
+    exp = np.asarray(expression, dtype=np.float64)
+
+    # 1. Expression entropy per spot
+    exp_pos = exp + 1e-10
+    exp_sum = exp_pos.sum(axis=1, keepdims=True)
+    p = exp_pos / exp_sum
+    entropy = (-p * np.log(p)).sum(axis=1).astype(np.float32)
+
+    # 2. Patch variance (if patches available)
+    if patches is not None:
+        pf = np.asarray(patches, dtype=np.float32)
+        if pf.ndim >= 3:
+            pf = pf.reshape(N, -1)
+        patch_var = pf.var(axis=1).astype(np.float32)
+    else:
+        patch_var = np.zeros(N, dtype=np.float32)
+
+    # 3. Normalize helper
+    def _norm(x: np.ndarray) -> np.ndarray:
+        lo, hi = x.min(), x.max()
+        if hi - lo < 1e-10:
+            return np.zeros_like(x, dtype=np.float32)
+        return ((x - lo) / (hi - lo)).astype(np.float32)
+
+    entropy_n = _norm(entropy)
+    patch_n = _norm(patch_var) if patches is not None else np.zeros(N, dtype=np.float32)
+
+    # 4. Build spatial graph + Laplacian
+    A = build_spatial_adjacency(coords, k=k_neighbours, weight="binary")
+    L = graph_laplacian(A)
+
+    # 5. Boundary energy for each feature
+    def _boundary_energy(feat: np.ndarray) -> np.ndarray:
+        s = L @ feat
+        return np.abs(s).astype(np.float32)
+
+    e_entropy = _norm(_boundary_energy(entropy_n))
+    e_patch = _norm(_boundary_energy(patch_n)) if patches is not None else np.zeros(N, dtype=np.float32)
+
+    # 6. Combine signals
+    if patches is not None:
+        base = 0.5 * entropy_n + 0.5 * patch_n
+        spatial_energy = 0.5 * e_entropy + 0.5 * e_patch
+        difficulty = (alpha_expr * entropy_n + alpha_hist * patch_n + alpha_spatial * spatial_energy)
+    else:
+        base = entropy_n
+        spatial_energy = e_entropy
+        difficulty = (0.5 * entropy_n + 0.5 * e_entropy)
+
+    return _norm(difficulty)
