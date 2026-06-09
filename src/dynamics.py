@@ -190,21 +190,64 @@ def build_difficulty_field(
     dbscan_eps: float = 50.0,
     interface_percentile: float = 80.0,
     expression: Optional[np.ndarray] = None,
+    skip_topology: bool = False,
 ) -> Dict[str, object]:
 
-    print("[Phase 3] Building dynamic spatial difficulty field D(x,y,t)...")
-    field = build_dynamics_field(dynamics, learn_threshold=learn_threshold)
+    if expression is not None and dynamics.epoch_mse.shape[0] == 0:
+        # Expression-based path — no warm-up training data.
+        # Build a minimal SpatialDynamicsField directly.
+        N = dynamics.N
+        coords = dynamics.coords
+        print("[Phase 3] Computing difficulty from expression data "
+              f"(no warm-up needed)…")
 
-    if expression is not None:
-        field.difficulty_score = topological_difficulty_from_data(
+        difficulty_score = topological_difficulty_from_data(
             expression=expression,
-            coords=field.coords,
+            coords=coords,
             k_neighbours=k_neighbours,
         )
-    else:
-        field.difficulty_score = gse_difficulty_from_field(
-            field, k=6, alpha=0.5
+
+        field = SpatialDynamicsField(
+            D_field=np.empty((0, N), dtype=np.float32),
+            D_bar=np.full(N, np.nan, dtype=np.float32),
+            dD_dt=np.full(N, np.nan, dtype=np.float32),
+            learning_speed=np.full(N, np.nan, dtype=np.float32),
+            volatility=np.full(N, np.nan, dtype=np.float32),
+            T_L=np.full(N, 0, dtype=np.int32),
+            coords=coords,
+            difficulty_score=difficulty_score,
         )
+
+        print(f"  difficulty_score: mean={difficulty_score.mean():.3f}  "
+              f"std={difficulty_score.std():.3f}")
+
+        if skip_topology:
+            print("[Phase 3] Topology analysis skipped (no epoch-wise dynamics).")
+            stats = {"mean_difficulty": float(difficulty_score.mean()),
+                     "std_difficulty": float(difficulty_score.std())}
+            topology = TopologyResult(
+                persistent_clusters=np.full(N, -1, dtype=np.int32),
+                wave_metric=np.zeros(N, dtype=np.float32),
+                interface_mask=np.zeros(N, dtype=bool),
+                interface_threshold=0.0,
+            )
+            return {"field": field, "topology": topology, "stats": stats}
+
+    else:
+        # Original path — dynamics object has real epoch data.
+        print("[Phase 3] Building dynamic spatial difficulty field D(x,y,t)...")
+        field = build_dynamics_field(dynamics, learn_threshold=learn_threshold)
+
+        if expression is not None:
+            field.difficulty_score = topological_difficulty_from_data(
+                expression=expression,
+                coords=field.coords,
+                k_neighbours=k_neighbours,
+            )
+        else:
+            field.difficulty_score = gse_difficulty_from_field(
+                field, k=6, alpha=0.5
+            )
 
     print("[Phase 3] Summary statistics:")
     stats = summarise_field(field)

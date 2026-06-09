@@ -8,14 +8,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable
 
-from .utils import Phase1Results, _seed_everything, _make_seeded_generator, move_to_device
+from .utils import Phase1Results, _seed_everything, move_to_device
 from .analysis import (
-    DifficultyDynamics, EpochMSECallback, run_difficulty_analysis
+    run_difficulty_analysis
 )
 from .dynamics import build_difficulty_field, SpatialDynamicsField, TopologyResult
 from .curriculum import (
     train_curriculum, TrainingLog,
-    save_init_checkpoint, load_init_checkpoint, reset_optimizer,
     evaluate as _evaluate,
 )
 from .evaluation import (
@@ -23,49 +22,38 @@ from .evaluation import (
 )
 
 def build_difficulty_repo(
-    model: nn.Module,
     train_base,
-    device: torch.device,
-    warmup_passes: int,
-    learn_threshold: float = 0.3,
+    k_neighbours: int = 6,
 ) -> dict:
     """
-    For each training slide, run warmup_passes forward passes and
-    compute a difficulty_score vector of shape [N_spots].
+    Build per-slide difficulty scores directly from gene expression
+    using topological difficulty (no training needed).
 
     Returns
     -------
     difficulty_repo : {slide_idx (int): np.ndarray shape [N_spots]}
     """
-    from .dataset import build_slide_loader
-    from .dynamics import build_dynamics_field
-    from .analysis import EpochMSECallback
+    from .difficulty_gse import topological_difficulty_from_data
 
     repo = {}
-    model.eval()
 
-    print(f"[DifficultyRepo] Building per-slide difficulty "
-          f"({len(train_base)} slides × {warmup_passes} passes)...")
+    print(f"[DifficultyRepo] Computing per-slide difficulty from expression "
+          f"({len(train_base)} slides)...")
 
     for slide_idx in range(len(train_base)):
         slide_name = train_base.names[slide_idx]
-        n_spots    = len(train_base.meta_dict[slide_name])
-        coords     = train_base.center_dict[slide_name].astype(float)
-        loader     = build_slide_loader(train_base, slide_index=slide_idx, batch_size=1)
+        expression = train_base.exp_dict[slide_name]           # (N_spots, G)
+        coords     = train_base.center_dict[slide_name].astype(float)  # (N_spots, 2)
 
-        cb = EpochMSECallback(n_spots=n_spots)
-        for _ in range(warmup_passes):
-            cb.record(model, loader, device)
+        scores = topological_difficulty_from_data(
+            expression=expression,
+            coords=coords,
+            k_neighbours=k_neighbours,
+        )
+        repo[slide_idx] = scores
 
-        dynamics = cb.to_dynamics(coords=coords)
-        field    = build_dynamics_field(dynamics, learn_threshold=learn_threshold)
-        repo[slide_idx] = field.difficulty_score  # [N_spots]
-
-        fnl   = float((field.T_L == field.T).mean())
-        d_bar = float(field.D_bar.mean())
-        print(f"  Slide {slide_name:>4} | N={n_spots:>3} | "
-              f"mean_score={field.difficulty_score.mean():.3f} | "
-              f"mean_D_bar={d_bar:.3f} | frac_never_learned={fnl:.2f}")
+        print(f"  Slide {slide_name:>4} | N={len(scores):>3} | "
+              f"mean_score={scores.mean():.3f} | std={scores.std():.3f}")
 
     return repo
 
@@ -193,81 +181,29 @@ class SpatialCurriculumPipeline:
        
         device = torch.device(self.cfg.training.device)
 
-        print("\n[Pipeline] Warm-up training to collect difficulty dynamics...")
-        warmup_epochs = max(1, int(self.cfg.training.total_epochs * self.cfg.curriculum.warmup_ratio))
-        print(f"  warm-up epochs: {warmup_epochs} "
-              f"(ratio={self.cfg.curriculum.warmup_ratio}, total={self.cfg.training.total_epochs})")
+        print("\n[Pipeline] Computing difficulty scores from expression data...")
+        print(f"  slides: {len(train_base)} | spots: {self.p1.coords.shape[0]}"
+              f" | using topological_difficulty_from_data")
 
-        cb = EpochMSECallback(n_spots=self.p1.coords.shape[0])
-        model.to(device)
-
-        warmup_val_losses = []
-        
-        for ep in range(warmup_epochs):
-            _train_one_epoch(
-                model, train_loader, optimizer, loss_fn,
-                device, max_grad_norm=self.cfg.training.max_grad_norm,
-            )
-            cb.record(model, val_loader, device)
-            if (ep + 1) % 5 == 0 or ep == 0:
-                print(f"  [Warm-up] Epoch {ep + 1}/{warmup_epochs}")
-
-            val_loss = _evaluate(
-                model=model,
-                loader=val_loader,
-                loss_fn=loss_fn,
-                device=device,
-            )
-
-            warmup_val_losses.append(float(val_loss))
-        
-        warmup_passes = max(20, warmup_epochs // max(len(train_base), 1))
-        
+        # Per-slide difficulty from expression (no training needed)
         difficulty_repo = build_difficulty_repo(
-            model, train_base, device,
-            warmup_passes=warmup_passes,
-            learn_threshold=self.cfg.difficulty.learn_threshold,
-        ) 
-        
-        dynamics = cb.to_dynamics(self.p1.coords)
-        self._warmup_val_losses = warmup_val_losses
-        
-        if len(warmup_val_losses) > 5:
+            train_base,
+            k_neighbours=self.cfg.difficulty.k_neighbours,
+        )
 
-            start_loss = warmup_val_losses[0]
-            end_loss = warmup_val_losses[-1]
-
-            improvement = (
-                start_loss - end_loss
-            ) / max(start_loss, 1e-8)
-
-            print(
-                f"[Warm-up] Validation improvement: "
-                f"{100*improvement:.1f}%"
-            )
-
-            if improvement < 0.05:
-                print(
-                    "[Warm-up] WARNING: "
-                    "Validation loss barely improved."
-                )
-                
-
-        if self.cfg.checkpoint.init_checkpoint is not None:
-            save_init_checkpoint(model, optimizer, self.cfg.checkpoint.init_checkpoint)
-            print(f"[Pipeline] Shared init checkpoint saved → {self.cfg.checkpoint.init_checkpoint}")
-        else:
-            print(
-                "[Pipeline] WARNING: init_checkpoint is None — curriculum and "
-                "baseline will start from different weights."
-            )
+        # Dummy dynamics — no warm-up training, so epoch_mse is empty.
+        # The field below only uses coords; difficulty_score comes from expression.
+        from .analysis import DifficultyDynamics
+        dynamics = DifficultyDynamics(
+            epoch_mse=np.empty((0, self.p1.coords.shape[0]), dtype=np.float32),
+            coords=self.p1.coords,
+        )
 
         self.difficulty_analysis_result = run_difficulty_analysis(self.p1, adata,
-                                                       dynamics=dynamics, 
-                                                       k_neighbours=self.cfg.difficulty.k_neighbours, 
+                                                       dynamics=dynamics,
+                                                       k_neighbours=self.cfg.difficulty.k_neighbours,
                                                        n_clusters=self.cfg.difficulty.n_clusters)
 
-        
         self.difficulty_field = build_difficulty_field(
             dynamics,
             learn_threshold=self.cfg.difficulty.learn_threshold,
@@ -275,23 +211,13 @@ class SpatialCurriculumPipeline:
             dbscan_eps=self.cfg.difficulty.dbscan_eps,
             interface_percentile=self.cfg.difficulty.interface_pct,
             expression=np.asarray(adata.X),
+            skip_topology=True,
         )
         self._field = self.difficulty_field["field"]
-        
 
-        fnl = self.difficulty_field["stats"]["frac_never_learned"]
-        if fnl > self.cfg.difficulty.max_never_learned_frac:
-            print(
-                f"\n[Pipeline] WARNING: {fnl:.1%} of spots never learned during "
-                f"warm-up (limit: {self.cfg.difficulty.max_never_learned_frac:.0%}).\n"
-                f"  The difficulty map D(x,y,t) is likely unreliable — the\n"
-                f"  curriculum will sort spots by noise, not biology.\n"
-                f"  Fixes:\n"
-                f"    • Increase warmup_ratio (current: {self.cfg.curriculum.warmup_ratio})\n"
-                f"    • Lower learn_threshold (current: {self.cfg.difficulty.learn_threshold})\n"
-                f"    • Check the model is actually converging during warm-up\n"
-                f"  Continuing — inspect results carefully.\n"
-            )
+        mean_d = self.difficulty_field["stats"]["mean_difficulty"]
+        std_d  = self.difficulty_field["stats"]["std_difficulty"]
+        print(f"[Pipeline] Difficulty score: mean={mean_d:.3f}  std={std_d:.3f}")
 
 
         model, log = train_curriculum(
@@ -300,7 +226,6 @@ class SpatialCurriculumPipeline:
             loss_fn,
             train_loader,
             val_loader,
-            self._field,
             difficulty_repo,
             cfg=self.cfg,
             total_epochs=self.cfg.training.total_epochs,

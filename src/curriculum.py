@@ -360,14 +360,13 @@ def train_curriculum(
     loss_fn: Callable,
     train_loader,
     val_loader,
-    field: SpatialDynamicsField,
     difficulty_repo,
     cfg,
     total_epochs: int = 50,
     device: Optional[torch.device] = None,
     init_checkpoint: Optional[str | Path] = None
 ) -> Tuple[nn.Module, TrainingLog]:
-   
+
     if device is None:
         device = torch.device(cfg.training.device)
 
@@ -377,21 +376,17 @@ def train_curriculum(
         print(f"[Checkpoint] Loaded warm-up weights from {init_checkpoint}")
 
     model.to(device)
-    sampler = TopologyAwareCurriculumSampler(field, cfg)
     scheduler = ThresholdScheduler(cfg, total_epochs)
     log = TrainingLog()
 
     # early stopping state
     best_val = float("inf")
     best_state: Optional[dict] = None
-    patience_counter = 0
 
     print(f"Starting curriculum training for {total_epochs} epochs...")
     print(
         f"  tau: {cfg.curriculum.tau_start:.2f} -> {cfg.curriculum.tau_end:.2f} | "
-        f"diffusion steps: {cfg.graph.graph_diffusion_steps} | "
-        f"stability lambda: {cfg.curriculum.stability_weight:.2f} | "
-        f"max_grad_norm: {cfg.training.max_grad_norm}"         # was cfg.max_grad_norm
+        f"max_grad_norm: {cfg.training.max_grad_norm}"
     )
 
     for epoch in range(total_epochs):
@@ -402,23 +397,23 @@ def train_curriculum(
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
         tau = scheduler.step(val_loss)
-        mask = sampler.get_mask(tau)
-        active_idx = sampler.mask_to_indices(mask)
 
+        # Per-slide spot selection is handled inside curriculum_train_epoch_v2
+        # using difficulty_repo scores directly. No global mask needed.
         train_loss = curriculum_train_epoch_v2(
             model, optimizer, loss_fn, train_loader, difficulty_repo, tau, device,
-            max_grad_norm=cfg.training.max_grad_norm
+            max_grad_norm=cfg.training.max_grad_norm,
+            min_mask_fraction=cfg.curriculum.min_mask_fraction,
         )
 
-        log.log(train_loss, val_loss, tau, mask, pcc=val_pcc)
+        log.log(train_loss, val_loss, tau, np.zeros(1), pcc=val_pcc)
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
             print(
                 f"  Epoch {epoch + 1:3d}/{total_epochs} | "
                 f"train={train_loss:.4f} | val={val_loss:.4f} | "
                 f"PCC={val_pcc:.4f} | "
-                f"tau={tau:.3f} | active spots={mask.sum()}/{field.N} "
-                f"({100 * mask.mean():.1f}%)"
+                f"tau={tau:.3f}"
             )
 
     # restore best weights
