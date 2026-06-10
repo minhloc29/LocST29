@@ -109,10 +109,10 @@ def _niches_via_leiden(
     adata.obsp["connectivities"] = adj
 
     if use_louvain:
-        sc.tl.louvain(adata, resolution=resolution, random_state=random_state)
+        sc.tl.louvain(adata, resolution=resolution, random_state=random_state, adjacency=adata.obsp["connectivities"])
         labels = np.array(adata.obs["louvain"].astype(int).values)
     else:
-        sc.tl.leiden(adata, resolution=resolution, random_state=random_state)
+        sc.tl.leiden(adata, resolution=resolution, random_state=random_state, adjacency=adata.obsp["connectivities"])
         labels = np.array(adata.obs["leiden"].astype(int).values)
 
     return labels.astype(np.int32)

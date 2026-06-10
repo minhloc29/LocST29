@@ -268,6 +268,9 @@ class SpatialCurriculumPipeline:
         std_d  = self.difficulty_field["stats"]["std_difficulty"]
         print(f"[Pipeline] Difficulty score: mean={mean_d:.3f}  std={std_d:.3f}")
 
+        baseline_model = self.train_baseline(
+            baseline_model, baseline_optimizer, loss_fn, train_loader, val_loader,
+        )
 
         model, log = train_curriculum(
             model,
@@ -284,9 +287,7 @@ class SpatialCurriculumPipeline:
         
         self._training_log = log
         
-        baseline_model = self.train_baseline(
-            baseline_model, baseline_optimizer, loss_fn, train_loader, val_loader,
-        )
+        
 
         evaluation_result = run_evaluation(
             model,

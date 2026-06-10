@@ -2,7 +2,7 @@ dataset:
 
   name: her2st
   data_root: null
-  fold: 2
+  fold: 0
   train_slide_index: 0
   test_slide_index: 0
   flatten: false
@@ -19,8 +19,8 @@ training:
 
 model:
 
-  module: "src.models.cnn"
-  class_name: "CNNBaseline"
+  module: "src.models.hist2st"
+  class_name: "Hist2ST"
   kwargs: {}
 
 
@@ -57,7 +57,7 @@ curriculum:
 
   warmup_ratio: 0.1
   tau_start: 0.10
-  tau_end: 1.00
+  tau_end: 2.00
   tau_warmup_epochs: 150
   stability_weight: 0.50
   min_mask_fraction: 0.10
@@ -71,7 +71,7 @@ graph:
 
 checkpoint:
 
-  init_checkpoint: "checkpoints/warmup_init.pt"
+  init_checkpoint: null
   resume: ""
 
 pipeline:
