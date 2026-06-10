@@ -9,7 +9,7 @@ dataset:
 
 training:
 
-  total_epochs: 300
+  total_epochs: 150
   batch_size: 1
   num_workers: 0
   lr: 0.00001
@@ -19,8 +19,8 @@ training:
 
 model:
 
-  module: "src.models.hist2st"
-  class_name: "Hist2ST"
+  module: "src.models.cnn"
+  class_name: "CNNBaseline"
   kwargs: {}
 
 
@@ -57,8 +57,8 @@ curriculum:
 
   warmup_ratio: 0.1
   tau_start: 0.10
-  tau_end: 2.00
-  tau_warmup_epochs: 150
+  tau_end: 1.0
+  tau_warmup_epochs: 100
   stability_weight: 0.50
   min_mask_fraction: 0.10
 
