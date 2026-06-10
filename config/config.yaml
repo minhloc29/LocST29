@@ -54,13 +54,17 @@ difficulty:
   max_never_learned_frac: 0.20
 
 curriculum:
-
-  warmup_ratio: 0.1
+  # Self-Paced Learning (SPL) parameters
+  enabled: true                    # true → SPL (loss-based); false → static difficulty
   tau_start: 0.10
   tau_end: 1.00
-  tau_warmup_epochs: 150
-  stability_weight: 0.50
   min_mask_fraction: 0.10
+
+  # Loss-based SPL settings
+  spl_loss_ema_alpha: 0.9          # EMA smoothing for per-niche loss (0=no smoothing)
+  spl_plateau_threshold: 0.005     # active loss must drop < this between epochs to trigger tau increase
+  spl_tau_step: 0.02               # how much to increase tau per plateau event
+  spl_initial_ordering: "loss"     # "loss" (pure SPL from epoch 0) or "static" (seed with difficulty_repo)
 
 
 graph:

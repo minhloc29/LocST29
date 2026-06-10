@@ -8,7 +8,7 @@ from sklearn.preprocessing import StandardScaler
 import hdbscan
 from .utils import build_spatial_graph, normalise_difficulty, smooth_on_graph
 from .analysis import DifficultyDynamics
-from .difficulty_gse import gse_difficulty_from_field, topological_difficulty_from_data
+from .difficulty import gse_difficulty_from_field, topological_difficulty_from_data
 
 
 @dataclass
@@ -20,20 +20,20 @@ class SpatialDynamicsField:
     ----------
     D_field  : (T, N) raw normalized difficulty at each epoch
     D_bar    : (N,) persistent hardness
-    dD_dt    : (N,) learning speed (signed slope)
-    learning_speed: (N,) absolute learning speed
+    learning_speed: (N,) learning speed (negative slope)
     volatility: (N,) temporal variance
     T_L      : (N,) learning time (epoch index; T if never learned)
     coords   : (N, 2)
+
+    difficulty_score : (N,) final difficulty score in [0,1]
     """
     D_field: np.ndarray
     D_bar: np.ndarray
-    dD_dt: np.ndarray
     learning_speed: np.ndarray
     volatility: np.ndarray
     T_L: np.ndarray
     coords: np.ndarray
-    
+
     difficulty_score: np.ndarray
     
     @property
@@ -75,9 +75,7 @@ def build_dynamics_field(
     t_c = t_vec - t_vec.mean()
     num = (t_c[:, None] * D_field).sum(axis=0)
     den = (t_c ** 2).sum()
-    dD_dt = (num / (den + 1e-10)).astype(np.float32)
-
-    learning_speed = -dD_dt
+    learning_speed = (-num / (den + 1e-10)).astype(np.float32)
     volatility = D_field.var(axis=0).astype(np.float32)
 
     # Learning time: first epoch where difficulty < threshold
@@ -99,15 +97,10 @@ def build_dynamics_field(
         return (x - x.min()) / (x.max() - x.min() + 1e-8)
 
     D_bar_n = normalize(D_bar)
-    print(np.percentile(
-    D_field.flatten(),
-    [1,5,10,25,50]
-))
 
     return SpatialDynamicsField(
         D_field=D_field,
         D_bar=D_bar,
-        dD_dt=dD_dt,
         learning_speed=learning_speed,
         volatility=volatility,
         T_L=T_L,
@@ -210,7 +203,6 @@ def build_difficulty_field(
         field = SpatialDynamicsField(
             D_field=np.empty((0, N), dtype=np.float32),
             D_bar=np.full(N, np.nan, dtype=np.float32),
-            dD_dt=np.full(N, np.nan, dtype=np.float32),
             learning_speed=np.full(N, np.nan, dtype=np.float32),
             volatility=np.full(N, np.nan, dtype=np.float32),
             T_L=np.full(N, 0, dtype=np.int32),
