@@ -12,7 +12,7 @@ training:
   total_epochs: 300
   batch_size: 1
   num_workers: 0
-  lr: 0.00001 
+  lr: 0.00001
   seed: 40
   device: cuda
   max_grad_norm: 1.0
@@ -22,6 +22,25 @@ model:
   module: "src.models.cnn"
   class_name: "CNNBaseline"
   kwargs: {}
+
+
+# ---------------------------------------------------------------------------
+# Niche / Microenvironment configuration
+# Set enabled: false to fall back to spot-level difficulty (original).
+# ---------------------------------------------------------------------------
+niche:
+
+  enabled: true                # true → niche-level difficulty; false → spot-level
+  method: "spatial_leiden"     # "spatial_leiden" | "spatial_kmeans" | "louvain"
+  resolution: 1.0              # Leiden resolution (larger → more niches)
+  spatial_weight: 0.3          # weight for spatial coords in joint feature space
+
+  # Niche difficulty component weights (must sum to 1.0 for the formula below)
+  # D_niche = alpha * heterogeneity + beta * topology + gamma * ambiguity
+  alpha: 0.40
+  beta: 0.30
+  gamma: 0.15
+  delta: 0.15                  # reserved for training-dynamics uncertainty
 
 
 difficulty:

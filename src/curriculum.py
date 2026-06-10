@@ -276,28 +276,59 @@ def curriculum_train_epoch_v2(
     max_grad_norm: float = 1.0,
     min_mask_fraction: float = 0.10,
 ) -> float:
+    """Train one epoch with curriculum-based spot selection.
+
+    The *difficulty_repo* dict supports two modes:
+
+    **Spot-level (original)** — ``{slide_id: np.ndarray(N_spots,)}``:
+        Select the easiest *spots* up to fraction tau.
+
+    **Niche-level (new)** — ``{slide_id: {"spot": ..., "niche": ...,
+    "niche_labels": ...}}``:
+        Select the easiest *niches* up to fraction tau; all spots in
+        an active niche are trained together.
+    """
     model.train()
     total_loss, total_n = 0.0, 0
 
     for x, y, idx, slide_id in loader:
         slide_id = int(slide_id)
 
-        # Spot selection using this slide's own difficulty scores
         if slide_id in difficulty_repo:
-            scores  = difficulty_repo[slide_id]   # [N_spots]
-            n_spots = len(scores)
-            n_active = max(
-                int(tau * n_spots),
-                int(min_mask_fraction * n_spots),
-            )
-            # easiest spots first (lowest difficulty score)
-            active_local = np.argsort(scores)[:n_active]
-            keep = torch.tensor(active_local, dtype=torch.long)
+            entry = difficulty_repo[slide_id]
+
+            # Detect mode: dict with "niche" key → niche-level
+            if isinstance(entry, dict) and "niche" in entry:
+                # --- Niche-level selection ---
+                niche_scores = entry["niche"]                # (K,)
+                niche_labels = entry["niche_labels"]          # (N_spots,)
+                n_niches = len(niche_scores)
+                n_active = max(
+                    int(tau * n_niches),
+                    int(min_mask_fraction * n_niches),
+                )
+                # Easiest niches first
+                active_niche_idx = np.argsort(niche_scores)[:n_active]
+                active_set = set(active_niche_idx.tolist())
+                keep = torch.tensor(
+                    [i for i, lbl in enumerate(niche_labels) if int(lbl) in active_set],
+                    dtype=torch.long,
+                )
+            else:
+                # --- Spot-level selection (original) ---
+                scores = entry if isinstance(entry, np.ndarray) else entry["spot"]
+                n_spots = len(scores)
+                n_active = max(
+                    int(tau * n_spots),
+                    int(min_mask_fraction * n_spots),
+                )
+                active_local = np.argsort(scores)[:n_active]
+                keep = torch.tensor(active_local, dtype=torch.long)
         else:
-            # fallback: random tau-based sampling for slides not in repo
-            n_spots  = y.shape[1] if y.ndim == 3 else y.shape[0]
+            # Fallback: random tau-based sampling for slides not in repo
+            n_spots = y.shape[1] if y.ndim == 3 else y.shape[0]
             n_active = max(int(tau * n_spots), 1)
-            keep     = torch.randperm(n_spots)[:n_active]
+            keep = torch.randperm(n_spots)[:n_active]
 
         if len(keep) == 0:
             continue
@@ -322,7 +353,7 @@ def curriculum_train_epoch_v2(
         optimizer.step()
 
         total_loss += loss.item() * len(keep)
-        total_n    += len(keep)
+        total_n += len(keep)
 
     return total_loss / max(total_n, 1)
 

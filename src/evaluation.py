@@ -527,6 +527,10 @@ class EvaluationReport:
     biological_overlaps: Dict[str, float] = field(default_factory=dict)
     spatial_error_autocorr: Optional["SpatialAutocorrReport"] = None
     paper_metrics: Optional[PaperMetricsReport] = None
+    # Niche-level evaluation (added in v2)
+    niche_stratified: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    niche_boundary: Dict[str, float] = field(default_factory=dict)
+    per_niche: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
     def print_summary(self) -> None:
         print("\n" + "=" * 60)
@@ -563,8 +567,35 @@ class EvaluationReport:
                 f"[min {r.random_min:.4f}, max {r.random_max:.4f}]"
             )
             print(f"   Percentile vs random: {r.random_percentile:.1f}th")
+
+        # --- Niche evaluation (v2) ---
+        if self.niche_stratified:
+            print("\n5. NICHE-STRATIFIED EVALUATION")
+            print(f"   {'Stratum':<20} {'N':>6} {'Curr MSE':>10} {'Base MSE':>10} "
+                  f"{'Δ MSE':>10} {'Curr PCC':>8} {'Base PCC':>8} {'Δ PCC':>8}")
+            print(f"   {'-' * 82}")
+            for label in ["easy_niches", "medium_niches", "hard_niches"]:
+                if label in self.niche_stratified:
+                    d = self.niche_stratified[label]
+                    print(f"   {label:<20} {d['n_spots']:>6} "
+                          f"{d['curriculum_mse']:>10.4f} {d['baseline_mse']:>10.4f} "
+                          f"{d['mse_gain']:>+10.4f} "
+                          f"{d['curriculum_pcc']:>8.4f} {d['baseline_pcc']:>8.4f} "
+                          f"{d['pcc_gain']:>+8.4f}")
+
+        if self.niche_boundary and self.niche_boundary.get("boundary_n_spots", 0) > 0:
+            print(f"\n6. NICHE BOUNDARY EVALUATION")
+            print(f"   Boundary spots: {self.niche_boundary['boundary_n_spots']} "
+                  f"({self.niche_boundary['boundary_fraction']:.1%})")
+            print(f"   Curriculum MSE: {self.niche_boundary['boundary_curriculum_mse']:.4f} "
+                  f"| Baseline MSE: {self.niche_boundary['boundary_baseline_mse']:.4f} "
+                  f"| Gain: {self.niche_boundary['boundary_mse_gain']:+.4f}")
+            print(f"   Curriculum PCC: {self.niche_boundary['boundary_curriculum_pcc']:.4f} "
+                  f"| Baseline PCC: {self.niche_boundary['boundary_baseline_pcc']:.4f} "
+                  f"| Gain: {self.niche_boundary['boundary_pcc_gain']:+.4f}")
+
         if self.paper_metrics is not None:
-            print("\n5. PAPER METRICS (RQ1–RQ4)")
+            print("\n7. PAPER METRICS (RQ1–RQ4)")
             self.paper_metrics.print_all()
         print("=" * 60 + "\n")
 
@@ -629,6 +660,132 @@ def spatial_error_autocorrelation(
         random_percentile=random_percentile,
     )
     return report, random_morans
+
+
+# ---------------------------------------------------------------------------
+# Niche-level evaluation
+# ---------------------------------------------------------------------------
+
+def per_niche_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    niche_labels: np.ndarray,
+) -> Dict[str, Dict[str, float]]:
+    """Compute MSE and PCC per niche.
+
+    Returns
+    -------
+    results : {niche_label_str: {"n_spots": ..., "mse": ..., "pcc": ...}}
+    """
+    K = int(niche_labels.max()) + 1
+    results: Dict[str, Dict[str, float]] = {}
+    for k in range(K):
+        mask = niche_labels == k
+        if mask.sum() == 0:
+            continue
+        p, t = pred[mask], target[mask]
+        results[f"niche_{k}"] = {
+            "n_spots": int(mask.sum()),
+            "mse": mse(p, t),
+            "pcc": pearson_correlation_coefficient(p, t),
+        }
+    return results
+
+
+def niche_stratified_evaluation(
+    pred_curriculum: np.ndarray,
+    pred_baseline: np.ndarray,
+    target: np.ndarray,
+    niche_labels: np.ndarray,
+    niche_scores: np.ndarray,
+    n_bins: int = 3,
+) -> Dict[str, Dict[str, float]]:
+    """Group niches by difficulty (easy/medium/hard) and compare models.
+
+    Key question: does curriculum learning improve *hard niches* more
+    than baseline?
+    """
+    K = len(niche_scores)
+    sorted_niches = np.argsort(niche_scores)
+    bin_size = K // n_bins
+    labels = ["easy_niches", "medium_niches", "hard_niches"]
+
+    results: Dict[str, Dict[str, float]] = {}
+    for i, label in enumerate(labels):
+        start = i * bin_size
+        end = K if i == n_bins - 1 else start + bin_size
+        bin_niches = set(sorted_niches[start:end].tolist())
+        mask = np.array([int(lbl) in bin_niches for lbl in niche_labels])
+
+        if mask.sum() == 0:
+            continue
+        c_pred = pred_curriculum[mask]
+        b_pred = pred_baseline[mask]
+        tgt = target[mask]
+
+        c_mse = mse(c_pred, tgt)
+        b_mse = mse(b_pred, tgt)
+        c_pcc = pearson_correlation_coefficient(c_pred, tgt)
+        b_pcc = pearson_correlation_coefficient(b_pred, tgt)
+
+        results[label] = {
+            "n_spots": int(mask.sum()),
+            "n_niches": int(mask.sum()),
+            "curriculum_mse": c_mse,
+            "baseline_mse": b_mse,
+            "mse_gain": b_mse - c_mse,
+            "curriculum_pcc": c_pcc,
+            "baseline_pcc": b_pcc,
+            "pcc_gain": c_pcc - b_pcc,
+        }
+
+    return results
+
+
+def niche_boundary_evaluation(
+    pred_curriculum: np.ndarray,
+    pred_baseline: np.ndarray,
+    target: np.ndarray,
+    niche_labels: np.ndarray,
+    coords: np.ndarray,
+    spatial_k: int = 6,
+) -> Dict[str, float]:
+    """Evaluate spots that lie on *niche-niche boundaries*.
+
+    A boundary spot is one whose neighbours belong to a different niche.
+    These regions are biologically meaningful (tissue interfaces) and
+    are expected to be the hardest.
+    """
+    from .utils import build_spatial_graph
+
+    edge_index, _ = build_spatial_graph(coords, k=spatial_k)
+    N = len(niche_labels)
+
+    # Mark spots whose neighbourhood contains a different niche
+    boundary = np.zeros(N, dtype=bool)
+    for src, dst in zip(edge_index[0], edge_index[1]):
+        if niche_labels[src] != niche_labels[dst]:
+            boundary[src] = True
+            boundary[dst] = True
+
+    if boundary.sum() == 0:
+        return {"boundary_n_spots": 0}
+
+    c_pred = pred_curriculum[boundary]
+    b_pred = pred_baseline[boundary]
+    tgt = target[boundary]
+
+    return {
+        "boundary_n_spots": int(boundary.sum()),
+        "boundary_fraction": float(boundary.mean()),
+        "boundary_curriculum_mse": mse(c_pred, tgt),
+        "boundary_baseline_mse": mse(b_pred, tgt),
+        "boundary_mse_gain": mse(b_pred, tgt) - mse(c_pred, tgt),
+        "boundary_curriculum_pcc": pearson_correlation_coefficient(c_pred, tgt),
+        "boundary_baseline_pcc": pearson_correlation_coefficient(b_pred, tgt),
+        "boundary_pcc_gain": pearson_correlation_coefficient(c_pred, tgt)
+        - pearson_correlation_coefficient(b_pred, tgt),
+    }
 
 
 @torch.no_grad()

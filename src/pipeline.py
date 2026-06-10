@@ -21,39 +21,80 @@ from .evaluation import (
     BiologicalAnnotations, EvaluationReport, run_evaluation
 )
 
+
 def build_difficulty_repo(
     train_base,
     k_neighbours: int = 6,
+    use_niches: bool = False,
+    niche_cfg: Optional = None,
 ) -> dict:
     """
-    Build per-slide difficulty scores directly from gene expression
-    using topological difficulty (no training needed).
+    Build per-slide difficulty scores from gene expression.
+
+    If *use_niches* is True, difficulty is computed at the **niche**
+    (microenvironment) level using ``niche_difficulty_from_data``.
+    Otherwise the original spot-level ``topological_difficulty_from_data``
+    is used (backward compatible).
 
     Returns
     -------
-    difficulty_repo : {slide_idx (int): np.ndarray shape [N_spots]}
+    difficulty_repo : dict
+        If use_niches is False:
+            {slide_idx (int): np.ndarray shape [N_spots]}
+        If use_niches is True:
+            {slide_idx (int): {
+                "spot":         np.ndarray [N_spots],
+                "niche":        np.ndarray [K],
+                "niche_labels": np.ndarray [N_spots],
+            }}
     """
-    from .difficulty_gse import topological_difficulty_from_data
+    from .difficulty_gse import topological_difficulty_from_data, niche_difficulty_from_data
 
     repo = {}
 
+    mode = "niche" if use_niches else "spot"
     print(f"[DifficultyRepo] Computing per-slide difficulty from expression "
-          f"({len(train_base)} slides)...")
+          f"({len(train_base)} slides, mode={mode})...")
 
     for slide_idx in range(len(train_base)):
         slide_name = train_base.names[slide_idx]
-        expression = train_base.exp_dict[slide_name]           # (N_spots, G)
-        coords     = train_base.center_dict[slide_name].astype(float)  # (N_spots, 2)
+        expression = train_base.exp_dict[slide_name]          # (N_spots, G)
+        coords = train_base.center_dict[slide_name].astype(float)  # (N_spots, 2)
 
-        scores = topological_difficulty_from_data(
-            expression=expression,
-            coords=coords,
-            k_neighbours=k_neighbours,
-        )
-        repo[slide_idx] = scores
-
-        print(f"  Slide {slide_name:>4} | N={len(scores):>3} | "
-              f"mean_score={scores.mean():.3f} | std={scores.std():.3f}")
+        if use_niches:
+            # --- Niche-level difficulty ---
+            kws = vars(niche_cfg) if niche_cfg is not None else {}
+            niche_labels, niche_scores, spot_scores = niche_difficulty_from_data(
+                expression=expression,
+                coords=coords,
+                alpha=kws.get("alpha", 0.40),
+                beta=kws.get("beta", 0.30),
+                gamma=kws.get("gamma", 0.15),
+                delta=kws.get("delta", 0.15),
+                method=kws.get("method", "spatial_leiden"),
+                resolution=kws.get("resolution", 1.0),
+                n_niches=kws.get("n_niches", None),
+                spatial_weight=kws.get("spatial_weight", 0.3),
+            )
+            repo[slide_idx] = {
+                "spot": spot_scores,
+                "niche": niche_scores,
+                "niche_labels": niche_labels,
+            }
+            print(f"  Slide {slide_name:>4} | N={len(spot_scores):>3} "
+                  f"K={len(niche_scores):>2} | "
+                  f"niche_mean={niche_scores.mean():.3f} | "
+                  f"spot_mean={spot_scores.mean():.3f}")
+        else:
+            # --- Spot-level difficulty (original) ---
+            scores = topological_difficulty_from_data(
+                expression=expression,
+                coords=coords,
+                k_neighbours=k_neighbours,
+            )
+            repo[slide_idx] = scores
+            print(f"  Slide {slide_name:>4} | N={len(scores):>3} | "
+                  f"mean_score={scores.mean():.3f} | std={scores.std():.3f}")
 
     return repo
 
@@ -178,17 +219,25 @@ class SpatialCurriculumPipeline:
         test_loader,
         bio_annotations: Optional[BiologicalAnnotations] = None,
     ) -> EvaluationReport:
-       
+
         device = torch.device(self.cfg.training.device)
 
-        print("\n[Pipeline] Computing difficulty scores from expression data...")
+        use_niches = getattr(self.cfg, "niche", None) is not None
+        if use_niches:
+            niche_cfg = self.cfg.niche
+            enabled = getattr(niche_cfg, "enabled", True)
+            use_niches = enabled
+
+        print(f"\n[Pipeline] Computing difficulty scores from expression data...")
         print(f"  slides: {len(train_base)} | spots: {self.p1.coords.shape[0]}"
-              f" | using topological_difficulty_from_data")
+              f" | mode={'niche' if use_niches else 'spot'}")
 
         # Per-slide difficulty from expression (no training needed)
         difficulty_repo = build_difficulty_repo(
             train_base,
             k_neighbours=self.cfg.difficulty.k_neighbours,
+            use_niches=use_niches,
+            niche_cfg=self.cfg.niche if use_niches else None,
         )
 
         # Dummy dynamics — no warm-up training, so epoch_mse is empty.

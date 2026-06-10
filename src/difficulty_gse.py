@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 from scipy.sparse import csr_matrix, diags
@@ -302,3 +302,62 @@ def topological_difficulty_from_data(
         difficulty = (0.5 * entropy_n + 0.5 * e_entropy)
 
     return _norm(difficulty)
+
+
+# ---------------------------------------------------------------------------
+# Niche-level difficulty (delegates to src.niche)
+# ---------------------------------------------------------------------------
+
+def niche_difficulty_from_data(
+    expression: np.ndarray,
+    coords: np.ndarray,
+    alpha: float = 0.40,
+    beta: float = 0.30,
+    gamma: float = 0.15,
+    delta: float = 0.15,
+    method: str = "spatial_leiden",
+    resolution: float = 1.0,
+    n_niches: Optional[int] = None,
+    spatial_weight: float = 0.3,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One-call convenience: build niches and compute niche-level difficulty.
+
+    Parameters
+    ----------
+    expression  : (N, G) log-normalised gene expression.
+    coords      : (N, 2) spatial coordinates.
+    alpha–delta : niche difficulty component weights (see
+                  ``compute_niche_difficulty``).
+    method      : niche construction method.
+    resolution  : Leiden resolution.
+    n_niches    : fixed niche count (only for k-means).
+    spatial_weight : spatial vs expression weight in joint feature space.
+
+    Returns
+    -------
+    niche_labels  : (N,) int — which niche each spot belongs to.
+    niche_scores  : (K,) float — difficulty of each niche.
+    spot_scores   : (N,) float — difficulty of each spot (mapped from niche).
+    """
+    from .niche import build_spatial_niches, compute_niche_difficulty
+
+    niche_labels = build_spatial_niches(
+        expression=expression,
+        coords=coords,
+        method=method,
+        resolution=resolution,
+        n_niches=n_niches,
+        spatial_weight=spatial_weight,
+    )
+
+    niche_scores, spot_scores = compute_niche_difficulty(
+        expression=expression,
+        coords=coords,
+        niche_labels=niche_labels,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        delta=delta,
+    )
+
+    return niche_labels, niche_scores, spot_scores
