@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
-from dataclasses import asdict
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -17,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from src import (
     DataConfig,
-    SpatialCurriculumPipeline,
+    SpatialCurriculumTrainer,
     SpatialModelAdapter,
     MultiSlideAdapter,
     build_slide_loader,
@@ -120,10 +117,9 @@ def main() -> None:
         device=cfg.training.device,
     )
 
-    print("[Pipeline] Running curriculum training...")
-    pipe = SpatialCurriculumPipeline(p1, cfg)
-    report = pipe.run(
-        adata=adata,
+    print("[Trainer] Running curriculum training...")
+    trainer = SpatialCurriculumTrainer(p1, cfg)
+    result = trainer.train(
         model=model,
         baseline_model=baseline_model,
         optimizer=optimizer,
@@ -132,23 +128,17 @@ def main() -> None:
         train_base=train_base,
         train_loader=train_loader,
         val_loader=val_loader,
-        test_loader=test_loader,
     )
 
     output_dir = Path(cfg.pipeline.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    report_path = output_dir / "report.json"
-    with report_path.open("w", encoding="utf-8") as f:
-        json.dump(_to_serialisable(asdict(report)), f, indent=2)
+    trainer.save_checkpoint(output_dir)
+    shutil.copy(args.config, output_dir / "config.yaml")
 
-    torch.save(model.state_dict(),          output_dir / "curriculum_model.pt")
-    torch.save(baseline_model.state_dict(), output_dir / "baseline_model.pt")
-    shutil.copy(args.config,                output_dir / "config.yaml")
-
-    report.print_summary()
-    print(f"\nSaved report  → {report_path}")
-    print(f"Saved models  → {output_dir}")
+    print(f"\nSaved models → {output_dir}")
+    print(f"Training log: {len(result['training_log'].train_loss)} epochs")
+    print("[Trainer] Done.")
 
 
 if __name__ == "__main__":

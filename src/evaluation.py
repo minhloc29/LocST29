@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 from scipy.stats import pearsonr, spearmanr
 
-from .dynamics import SpatialDynamicsField, TopologyResult
+from .dynamics import SpatialDynamicsField
 from .curriculum import TrainingLog
 from .utils import move_to_device, flatten_indices
 from .utils import prepare_morans_adata, morans_i_scanpy_from_adata
@@ -444,7 +444,7 @@ def compute_paper_metrics(
     pred_baseline: np.ndarray,
     target: np.ndarray,
     field: SpatialDynamicsField,
-    topology: Optional[TopologyResult] = None,
+    topology: Optional[object] = None,
     training_log_curriculum: Optional[TrainingLog] = None,
     epoch_pccs_curriculum: Optional[List[float]] = None,
     training_log_baseline: Optional[TrainingLog] = None,

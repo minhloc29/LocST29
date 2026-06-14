@@ -1,31 +1,24 @@
+"""Trainer: build niches → assign difficulty → curriculum train → save model."""
+
 from __future__ import annotations
 
 import numpy as np
 import torch
 import torch.nn as nn
-import anndata as ad
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable
 
 from .utils import Phase1Results, _seed_everything, move_to_device
-from .analysis import (
-    run_difficulty_analysis
-)
-from .dynamics import build_difficulty_field, SpatialDynamicsField, TopologyResult
 from .curriculum import (
     train_curriculum, TrainingLog,
     evaluate as _evaluate,
-)
-from .evaluation import (
-    BiologicalAnnotations, EvaluationReport, run_evaluation
 )
 
 
 def build_difficulty_repo(
     train_base,
     k_neighbours: int = 6,
-    use_niches: bool = False,
+    use_niches: bool = True,
     niche_cfg: Optional = None,
 ) -> dict:
     """
@@ -48,7 +41,7 @@ def build_difficulty_repo(
                 "niche_labels": np.ndarray [N_spots],
             }}
     """
-    from .difficulty_gse import topological_difficulty_from_data, niche_difficulty_from_data
+    from .difficulty import topological_difficulty_from_data, niche_difficulty_from_data
 
     repo = {}
 
@@ -112,7 +105,7 @@ def _train_one_epoch(
     total_loss, total_n = 0.0, 0
     for batch in loader:
         x, y = batch[0], batch[1]
-        
+
         optimizer.zero_grad()
         x = move_to_device(x, device)
         pred = model(x)
@@ -134,20 +127,22 @@ def _train_one_epoch(
     return total_loss / max(total_n, 1)
 
 
-class SpatialCurriculumPipeline:
-    
-    def __init__(self, p1: Phase1Results, cfg: Optional = None):
+class SpatialCurriculumTrainer:
+
+    def __init__(self, p1: Phase1Results, cfg=None):
         self.p1 = p1
         self.cfg = cfg
         _seed_everything(self.cfg.training.seed)
 
-        self.difficulty_analysis_result = None
-        self.difficulty_field = None
+        self.difficulty_repo: Optional[dict] = None
         self._training_log: Optional[TrainingLog] = None
-        self._field: Optional[SpatialDynamicsField] = None
 
+        # Set by train()
+        self.model: Optional[nn.Module] = None
+        self.baseline_model: Optional[nn.Module] = None
+        self.optimizer: Optional[torch.optim.Optimizer] = None
+        self.baseline_optimizer: Optional[torch.optim.Optimizer] = None
 
-   
     def train_baseline(
         self,
         baseline_model: nn.Module,
@@ -156,13 +151,12 @@ class SpatialCurriculumPipeline:
         train_loader,
         val_loader,
     ) -> nn.Module:
-    
+
         device = torch.device(self.cfg.training.device)
 
         if self.cfg.checkpoint.init_checkpoint is not None:
             ckpt = torch.load(self.cfg.checkpoint.init_checkpoint, map_location=device)
             baseline_model.load_state_dict(ckpt["model_state_dict"])
-            # optimizer stays fresh (default Adam state) — no reset spike
             print(f"[Baseline] Loaded warm-up weights from {self.cfg.checkpoint.init_checkpoint}")
         else:
             print(
@@ -186,7 +180,7 @@ class SpatialCurriculumPipeline:
                     k: v.cpu().clone()
                     for k, v in baseline_model.state_dict().items()
                 }
-               
+
             train_loss = _train_one_epoch(
                 baseline_model, train_loader, baseline_optimizer, loss_fn,
                 device, max_grad_norm=self.cfg.training.max_grad_norm,
@@ -204,10 +198,8 @@ class SpatialCurriculumPipeline:
 
         return baseline_model
 
-
-    def run(
+    def train(
         self,
-        adata: ad.AnnData,
         model: nn.Module,
         baseline_model: nn.Module,
         optimizer: torch.optim.Optimizer,
@@ -216,9 +208,16 @@ class SpatialCurriculumPipeline:
         train_base,
         train_loader,
         val_loader,
-        test_loader,
-        bio_annotations: Optional[BiologicalAnnotations] = None,
-    ) -> EvaluationReport:
+    ) -> dict:
+        """
+        Run full curriculum training.
+
+        Returns a dict with trained models, training log, and difficulty repo.
+        """
+        self.model = model
+        self.baseline_model = baseline_model
+        self.optimizer = optimizer
+        self.baseline_optimizer = baseline_optimizer
 
         device = torch.device(self.cfg.training.device)
 
@@ -228,75 +227,44 @@ class SpatialCurriculumPipeline:
             enabled = getattr(niche_cfg, "enabled", True)
             use_niches = enabled
 
-        print(f"\n[Pipeline] Computing difficulty scores from expression data...")
+        print(f"\n[Trainer] Computing difficulty scores from expression data...")
         print(f"  slides: {len(train_base)} | spots: {self.p1.coords.shape[0]}"
               f" | mode={'niche' if use_niches else 'spot'}")
 
-        # Per-slide difficulty from expression (no training needed)
-        difficulty_repo = build_difficulty_repo(
+        # ── Step 1: build niche difficulty for all training slides ──
+        self.difficulty_repo = build_difficulty_repo(
             train_base,
             k_neighbours=self.cfg.difficulty.k_neighbours,
             use_niches=use_niches,
             niche_cfg=self.cfg.niche if use_niches else None,
         )
 
-        # Dummy dynamics — no warm-up training, so epoch_mse is empty.
-        # The field below only uses coords; difficulty_score comes from expression.
-        from .analysis import DifficultyDynamics
-        dynamics = DifficultyDynamics(
-            epoch_mse=np.empty((0, self.p1.coords.shape[0]), dtype=np.float32),
-            coords=self.p1.coords,
-        )
-
-        self.difficulty_analysis_result = run_difficulty_analysis(self.p1, adata,
-                                                       dynamics=dynamics,
-                                                       k_neighbours=self.cfg.difficulty.k_neighbours,
-                                                       n_clusters=self.cfg.difficulty.n_clusters)
-
-        self.difficulty_field = build_difficulty_field(
-            dynamics,
-            learn_threshold=self.cfg.difficulty.learn_threshold,
-            k_neighbours=self.cfg.difficulty.k_neighbours,
-            dbscan_eps=self.cfg.difficulty.dbscan_eps,
-            interface_percentile=self.cfg.difficulty.interface_pct,
-            expression=np.asarray(adata.X),
-            skip_topology=True,
-        )
-        self._field = self.difficulty_field["field"]
-
-        mean_d = self.difficulty_field["stats"]["mean_difficulty"]
-        std_d  = self.difficulty_field["stats"]["std_difficulty"]
-        print(f"[Pipeline] Difficulty score: mean={mean_d:.3f}  std={std_d:.3f}")
-
-        baseline_model = self.train_baseline(
+        # ── Step 2: baseline (full-data, no curriculum) ──
+        self.baseline_model = self.train_baseline(
             baseline_model, baseline_optimizer, loss_fn, train_loader, val_loader,
         )
 
-        model, log = train_curriculum(
-            model,
-            optimizer,
-            loss_fn,
-            train_loader,
-            val_loader,
-            difficulty_repo,
+        # ── Step 3: curriculum training ──
+        self.model, self._training_log = train_curriculum(
+            self.model, self.optimizer, loss_fn,
+            train_loader, val_loader, self.difficulty_repo,
             cfg=self.cfg,
             total_epochs=self.cfg.training.total_epochs,
             device=device,
             init_checkpoint=self.cfg.checkpoint.init_checkpoint,
         )
-        
-        self._training_log = log
-        
-        
 
-        evaluation_result = run_evaluation(
-            model,
-            baseline_model,
-            test_loader,
-            self._field,
-            self._training_log,
-            device,
-            bio_annotations=bio_annotations,
-            hard_percentile=self.cfg.difficulty.hard_percentile,
-        )
-        return evaluation_result
+        return {
+            "model": self.model,
+            "baseline_model": self.baseline_model,
+            "training_log": self._training_log,
+            "difficulty_repo": self.difficulty_repo,
+        }
+
+    def save_checkpoint(self, output_dir: str | Path) -> None:
+        """Save trained models to disk."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self.model.state_dict(),          output_dir / "curriculum_model.pt")
+        torch.save(self.baseline_model.state_dict(), output_dir / "baseline_model.pt")
+        print(f"[Trainer] Models saved to {output_dir}")

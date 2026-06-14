@@ -3,29 +3,13 @@ from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, Optional
-from sklearn.cluster import DBSCAN
-from sklearn.preprocessing import StandardScaler
-import hdbscan
-from .utils import build_spatial_graph, normalise_difficulty, smooth_on_graph
 from .analysis import DifficultyDynamics
 from .difficulty_gse import gse_difficulty_from_field, topological_difficulty_from_data
 
 
 @dataclass
 class SpatialDynamicsField:
-    """
-    Derived maps from the dynamic difficulty field D(x,y,t).
-
-    Attributes
-    ----------
-    D_field  : (T, N) raw normalized difficulty at each epoch
-    D_bar    : (N,) persistent hardness
-    dD_dt    : (N,) learning speed (signed slope)
-    learning_speed: (N,) absolute learning speed
-    volatility: (N,) temporal variance
-    T_L      : (N,) learning time (epoch index; T if never learned)
-    coords   : (N, 2)
-    """
+   
     D_field: np.ndarray
     D_bar: np.ndarray
     dD_dt: np.ndarray
@@ -116,56 +100,6 @@ def build_dynamics_field(
     )
 
 
-@dataclass
-class TopologyResult:
-    """
-    Outputs of spatial topology analysis.
-    """
-    persistent_clusters: np.ndarray
-    wave_metric: np.ndarray
-    interface_mask: np.ndarray
-    interface_threshold: float
-
-
-def analyse_topology(
-    field: SpatialDynamicsField,
-    k_neighbours: int = 6,
-    dbscan_eps: float = 50.0,
-    dbscan_min_samples: int = 5,
-    interface_percentile: float = 80.0,
-) -> TopologyResult:
-    """
-    Run all three topology analyses.
-    """
-    N = field.N
-    coords = field.coords
-
-    # 1. Clusters of persistent hardness
-    hard_mask = field.difficulty_score > np.median(field.difficulty_score)
-    cluster_labels = np.full(N, -1, dtype=np.int32)
-    if hard_mask.sum() > dbscan_min_samples:
-        hard_coords = coords[hard_mask]
-        db = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples)
-        sub_labels = db.fit_predict(hard_coords)
-        sub_labels_shifted = np.where(sub_labels >= 0, sub_labels, -1)
-        cluster_labels[hard_mask] = sub_labels_shifted
-
-    # 2. Learning waves (spatial propagation of speed)
-    edge_index, edge_weight = build_spatial_graph(coords, k=k_neighbours)
-    smoothed_speed = smooth_on_graph(field.learning_speed, edge_index, edge_weight, n_iter=2)
-    wave_metric = (field.learning_speed - smoothed_speed).astype(np.float32)
-
-    # 3. Interface zones of late learning
-    T_L_float = field.T_L.astype(np.float32)
-    thresh = np.percentile(T_L_float, interface_percentile)
-    interface_mask = T_L_float >= thresh
-
-    return TopologyResult(
-        persistent_clusters=cluster_labels,
-        wave_metric=wave_metric,
-        interface_mask=interface_mask,
-        interface_threshold=float(thresh),
-    )
 
 
 def summarise_field(field: SpatialDynamicsField) -> Dict[str, float]:
@@ -187,10 +121,7 @@ def build_difficulty_field(
     dynamics: DifficultyDynamics,
     learn_threshold: float = 0.3,
     k_neighbours: int = 6,
-    dbscan_eps: float = 50.0,
-    interface_percentile: float = 80.0,
     expression: Optional[np.ndarray] = None,
-    skip_topology: bool = False,
 ) -> Dict[str, object]:
 
     if expression is not None and dynamics.epoch_mse.shape[0] == 0:
@@ -221,17 +152,8 @@ def build_difficulty_field(
         print(f"  difficulty_score: mean={difficulty_score.mean():.3f}  "
               f"std={difficulty_score.std():.3f}")
 
-        if skip_topology:
-            print("[Phase 3] Topology analysis skipped (no epoch-wise dynamics).")
-            stats = {"mean_difficulty": float(difficulty_score.mean()),
-                     "std_difficulty": float(difficulty_score.std())}
-            topology = TopologyResult(
-                persistent_clusters=np.full(N, -1, dtype=np.int32),
-                wave_metric=np.zeros(N, dtype=np.float32),
-                interface_mask=np.zeros(N, dtype=bool),
-                interface_threshold=0.0,
-            )
-            return {"field": field, "topology": topology, "stats": stats}
+        stats = summarise_field(field)
+        return {"field": field, "topology": None, "stats": stats}
 
     else:
         # Original path — dynamics object has real epoch data.
@@ -251,21 +173,6 @@ def build_difficulty_field(
 
     print("[Phase 3] Summary statistics:")
     stats = summarise_field(field)
-
-    print("[Phase 3] Running spatial topology analysis...")
-    topology = analyse_topology(
-        field,
-        k_neighbours=k_neighbours,
-        dbscan_eps=dbscan_eps,
-        interface_percentile=interface_percentile,
-    )
-
-    n_clusters = len(set(topology.persistent_clusters[topology.persistent_clusters >= 0]))
-    print(f"  Persistent-hardness clusters found: {n_clusters}")
-    print(
-        f"  Interface-zone spots: {topology.interface_mask.sum()} "
-        f"({100 * topology.interface_mask.mean():.1f}%)"
-    )
     print("[Phase 3] Done.")
 
-    return {"field": field, "topology": topology, "stats": stats}
+    return {"field": field, "topology": None, "stats": stats}

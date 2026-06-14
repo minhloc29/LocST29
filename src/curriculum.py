@@ -401,8 +401,6 @@ def train_curriculum(
     if device is None:
         device = torch.device(cfg.training.device)
 
-    print(init_checkpoint)
-    init_checkpoint = None
     if init_checkpoint is not None:
         ckpt = torch.load(str(init_checkpoint), map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])

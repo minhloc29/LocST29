@@ -1,6 +1,6 @@
 """Spatial curriculum learning package."""
 
-from .pipeline import SpatialCurriculumPipeline
+from .Trainer import SpatialCurriculumTrainer, build_difficulty_repo
 from .dataset import (
     DataConfig,
     Her2STDataset,
@@ -15,7 +15,8 @@ from .dataset import (
 from .models import Hist2ST
 
 __all__ = [
-    "SpatialCurriculumPipeline",
+    "SpatialCurriculumTrainer",
+    "build_difficulty_repo",
     "DataConfig",
     "Her2STDataset",
     "CSCCDataset",
