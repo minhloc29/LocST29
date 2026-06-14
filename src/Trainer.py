@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 
 from .utils import Phase1Results, _seed_everything, move_to_device
 from .curriculum import (
@@ -136,6 +136,7 @@ class SpatialCurriculumTrainer:
 
         self.difficulty_repo: Optional[dict] = None
         self._training_log: Optional[TrainingLog] = None
+        self._baseline_log: Optional[TrainingLog] = None
 
         # Set by train()
         self.model: Optional[nn.Module] = None
@@ -150,7 +151,7 @@ class SpatialCurriculumTrainer:
         loss_fn: Callable,
         train_loader,
         val_loader,
-    ) -> nn.Module:
+    ) -> Tuple[nn.Module, TrainingLog]:
 
         device = torch.device(self.cfg.training.device)
 
@@ -167,6 +168,7 @@ class SpatialCurriculumTrainer:
         baseline_model.to(device)
         best_val = float("inf")
         best_state = None
+        baseline_log = TrainingLog()
 
         print(f"[Baseline] Training for up to {self.cfg.training.total_epochs} epochs")
 
@@ -186,6 +188,8 @@ class SpatialCurriculumTrainer:
                 device, max_grad_norm=self.cfg.training.max_grad_norm,
             )
 
+            baseline_log.log(train_loss, val_loss, tau=1.0, mask=np.ones(1))
+
             if (epoch + 1) % 5 == 0 or epoch == 0:
                 print(
                     f"  [Baseline] Epoch {epoch + 1:3d}/{self.cfg.training.total_epochs} | "
@@ -196,7 +200,7 @@ class SpatialCurriculumTrainer:
             baseline_model.load_state_dict(best_state)
             print(f"[Baseline] Best val checkpoint restored (val={best_val:.4f}).")
 
-        return baseline_model
+        return baseline_model, baseline_log
 
     def train(
         self,
@@ -240,7 +244,7 @@ class SpatialCurriculumTrainer:
         )
 
         # ── Step 2: baseline (full-data, no curriculum) ──
-        self.baseline_model = self.train_baseline(
+        self.baseline_model, self._baseline_log = self.train_baseline(
             baseline_model, baseline_optimizer, loss_fn, train_loader, val_loader,
         )
 
@@ -258,6 +262,7 @@ class SpatialCurriculumTrainer:
             "model": self.model,
             "baseline_model": self.baseline_model,
             "training_log": self._training_log,
+            "baseline_log": self._baseline_log,
             "difficulty_repo": self.difficulty_repo,
         }
 

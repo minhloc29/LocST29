@@ -130,8 +130,27 @@ def boundary_hard_evaluation(
     field: SpatialDynamicsField,
     percentile: float = 75.0,
 ) -> Dict[str, float]:
-    
-    hard_mask = field.difficulty_score > np.percentile(field.difficulty_score, percentile)
+    """Compare curriculum and baseline on the hardest *percentile* spots.
+
+    Uses exact rank-based selection (takes top ``(100 - percentile)%`` of spots
+    by difficulty_score) to avoid tie issues at the percentile boundary.
+    """
+    ds = field.difficulty_score
+    N = len(ds)
+
+    # Rank-based: select top (100 - percentile)% hardest spots
+    n_hard = max(1, int(N * (100.0 - percentile) / 100.0))
+    sorted_idx = np.argsort(ds)
+    hard_local_idx = sorted_idx[-n_hard:]
+    hard_mask = np.zeros(N, dtype=bool)
+    hard_mask[hard_local_idx] = True
+
+    print(f"  [DEBUG boundary_hard] difficulty_score: min={ds.min():.4f} max={ds.max():.4f} "
+          f"mean={ds.mean():.4f} std={ds.std():.6f} unique={len(np.unique(ds))}")
+    print(f"  [DEBUG boundary_hard] selecting top {n_hard}/{N} = {n_hard/N:.3f} hardest "
+          f"(scores >= {ds[hard_local_idx[0]]:.4f})")
+    for q in [10, 25, 50, 75, 90, 95, 99]:
+        print(f"    P{q:3d}: {np.percentile(ds, q):.6f}")
 
     curr_metrics = per_region_metrics(pred_curriculum, target, hard_mask, "Curriculum_Hard")
     base_metrics = per_region_metrics(pred_baseline, target, hard_mask, "Baseline_Hard")
@@ -329,8 +348,18 @@ def difficulty_error_correlation(
     pearson_r  : float
     spearman_rho : float
     """
+    print(f"  [DEBUG corr] difficulty_score: min={difficulty_score.min():.4f} max={difficulty_score.max():.4f} mean={difficulty_score.mean():.4f} std={difficulty_score.std():.6f}")
+    print(f"  [DEBUG corr] per_spot_error: min={per_spot_error.min():.4f} max={per_spot_error.max():.4f} mean={per_spot_error.mean():.4f} std={per_spot_error.std():.6f}")
+    # Scatter: group by percentile
+    for q_low, q_high, label in [(0, 25, "bottom25"), (25, 50, "mid_low"), (50, 75, "mid_high"), (75, 100, "top25")]:
+        lo = np.percentile(difficulty_score, q_low)
+        hi = np.percentile(difficulty_score, q_high)
+        mask = (difficulty_score >= lo) & (difficulty_score < hi) if q_high < 100 else (difficulty_score >= lo) & (difficulty_score <= hi)
+        if mask.sum() > 0:
+            print(f"    {label}: n={mask.sum():>4}  mean_err={per_spot_error[mask].mean():.4f}  mean_ds={difficulty_score[mask].mean():.4f}")
     r_pearson, _ = pearsonr(difficulty_score, per_spot_error)
     r_spearman, _ = spearmanr(difficulty_score, per_spot_error)
+    print(f"  [DEBUG corr] pearson={r_pearson:.4f}  spearman={r_spearman:.4f}")
     return float(r_pearson), float(r_spearman)
 
 

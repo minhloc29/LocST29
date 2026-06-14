@@ -83,6 +83,20 @@ def build_dynamics_field(
         return (x - x.min()) / (x.max() - x.min() + 1e-8)
 
     D_bar_n = normalize(D_bar)
+    print(f"[DEBUG build_dynamics_field] D_field:    "
+          f"min={D_field.min():.4f} max={D_field.max():.4f} "
+          f"mean={D_field.mean():.4f} std={D_field.std():.6f}")
+    print(f"[DEBUG build_dynamics_field] D_bar:      "
+          f"min={D_bar.min():.4f} max={D_bar.max():.4f} "
+          f"mean={D_bar.mean():.4f} std={D_bar.std():.6f}")
+    print(f"[DEBUG build_dynamics_field] D_bar_norm: "
+          f"min={D_bar_n.min():.4f} max={D_bar_n.max():.4f} "
+          f"mean={D_bar_n.mean():.4f} std={D_bar_n.std():.6f}")
+    print(f"[DEBUG build_dynamics_field] difficulty_score (final): "
+          f"min={D_bar_n.min():.4f} max={D_bar_n.max():.4f} "
+          f"mean={D_bar_n.mean():.4f} std={D_bar_n.std():.6f}")
+    for q in [10, 25, 50, 75, 90]:
+        print(f"[DEBUG build_dynamics_field]  P{q:3d} difficulty: {np.percentile(D_bar_n, q):.6f}")
     print(np.percentile(
     D_field.flatten(),
     [1,5,10,25,50]
