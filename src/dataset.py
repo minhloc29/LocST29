@@ -227,6 +227,15 @@ class Her2STDataset(Dataset):
 
         x = df["x"].values
         y = df["y"].values
+
+        # Handle NaN coordinates — skip rows with NaN
+        valid = ~(np.isnan(x) | np.isnan(y))
+        if not valid.all():
+            print(f"  [WARN Her2STDataset] Dropping {len(x)-valid.sum()} rows with NaN coordinates from {name}")
+            x = x[valid]
+            y = y[valid]
+            df = df[valid].reset_index(drop=True)
+
         x = np.around(x).astype(int)
         y = np.around(y).astype(int)
         

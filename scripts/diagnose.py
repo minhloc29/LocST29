@@ -77,15 +77,21 @@ def main():
     train_base = load_dataset(data_cfg, train=True)
     test_base = load_dataset(data_cfg, train=False)
 
-    # Only one slide? Get the first slide's data
-    slide_idx = 0
-    slide_name = test_base.names[slide_idx]
+    # Get the first slide's data
+    slide_name = test_base.names[0]
     expression = test_base.exp_dict[slide_name]
-    coords = test_base.center_dict[slide_idx].astype(float)
+    coords = test_base.center_dict[slide_name].astype(float)
     N = coords.shape[0]
     print(f"  Slide: {slide_name} | N={N} spots | G={expression.shape[1]} genes")
     print(f"  Expression: min={expression.min():.2f} max={expression.max():.2f} "
           f"mean={expression.mean():.4f} std={expression.std():.4f}")
+    print(f"  Expression NaN count: {np.isnan(expression).sum()} / {expression.size}")
+    print(f"  Expression Inf count: {np.isinf(expression).sum()} / {expression.size}")
+    print(f"  Coords NaN: {np.isnan(coords).sum()}")
+    # Fix NaN/Inf in expression
+    if np.isnan(expression).any() or np.isinf(expression).any():
+        expression = np.nan_to_num(expression, nan=0.0, posinf=0.0, neginf=0.0)
+        print(f"  -> Fixed NaN/Inf in expression, repalced with 0")
 
     # ── 2. Compute difficulty scores directly ──
     print("\n" + "=" * 70)
