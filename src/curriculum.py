@@ -4,17 +4,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional, List, Callable, Tuple
 
-from .utils import build_spatial_graph, smooth_on_graph, expand_mask_k_hops
 from .utils import (
     move_to_device,
     flatten_indices,
     select_active_inputs,
     select_active_targets,
 )
-from .dynamics import SpatialDynamicsField
 
 
 
@@ -43,48 +40,6 @@ class ThresholdScheduler:
         return self.tau
 
 
-class TopologyAwareCurriculumSampler:
-    def __init__(self, field: SpatialDynamicsField, cfg):
-        self.cfg = cfg
-        self.difficulty_score = field.difficulty_score
-        self.coords = field.coords
-        self.N = field.N
-        self.edge_index, self.edge_weight = build_spatial_graph(
-            self.coords, k=cfg.difficulty.k_neighbours    # was cfg.difficulty.k_neighbours (now explicit)
-        )
-        self._prev_mask: Optional[np.ndarray] = None
-
-    def get_mask(self, tau: float) -> np.ndarray:
-        n_active = max(
-            int(tau * self.N),
-            int(self.cfg.curriculum.min_mask_fraction * self.N),   # was cfg.min_mask_fraction
-        )
-        idx = np.argsort(self.difficulty_score)
-        base_mask = np.zeros(self.N, dtype=np.float32)
-        base_mask[idx[:n_active]] = 1.0
-
-        expanded = base_mask.astype(bool)
-        for _ in range(self.cfg.graph.graph_diffusion_steps):      # was cfg.graph_diffusion_steps
-            expanded = expand_mask_k_hops(
-                expanded,
-                self.edge_index,
-                k=self.cfg.graph.graph_expansion_hops,             # was cfg.graph_expansion_hops
-            )
-
-        if self._prev_mask is not None:
-            lam = self.cfg.curriculum.stability_weight             # was cfg.stability_weight
-            combined = lam * self._prev_mask + (1 - lam) * expanded.astype(np.float32)
-            final_mask = (combined >= 0.5).astype(bool)
-        else:
-            final_mask = expanded
-
-        self._prev_mask = final_mask.astype(np.float32)
-        return final_mask
-
-    def mask_to_indices(self, mask: np.ndarray) -> np.ndarray:
-        return np.where(mask)[0]
-
-
 @dataclass
 class TrainingLog:
     train_loss: List[float] = field(default_factory=list)
@@ -105,95 +60,8 @@ class TrainingLog:
 
 
 
-def curriculum_train_epoch(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    loss_fn: Callable,
-    loader,
-    active_indices: np.ndarray,
-    device: torch.device,
-    max_grad_norm: float = 1.0
-) -> float:
-   
-    model.train()
-    active_set = set(active_indices.tolist())
-    total_loss, total_n = 0.0, 0
-
-    for x, y, idx in loader:
-        idx_flat = flatten_indices(idx)
-    
-        keep = torch.tensor(
-            [i for i, sp in enumerate(idx_flat.tolist()) if sp in active_set],
-            dtype=torch.long,
-        )
-
-        if len(keep) == 0:
-            continue
-
-        x_k = move_to_device(select_active_inputs(x, keep), device)
-        y_k = select_active_targets(y, keep).to(device)
-
-        optimizer.zero_grad()
-        pred = model(x_k)
-        if isinstance(pred, tuple):
-            pred = pred[0]
-        
-        if y_k.ndim == 3 and y_k.shape[0] == 1:
-            y_k = y_k.squeeze(0)
-        if pred.ndim == 3 and pred.shape[0] == 1:
-            pred = pred.squeeze(0)
-
-        assert pred.shape == y_k.shape, (      # ← inside loop: correct
-            f"pred={pred.shape}, target={y_k.shape}"
-        )
-
-        loss = loss_fn(pred, y_k)
-        loss.backward()
-
-        if max_grad_norm > 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-
-        optimizer.step()
-
-        total_loss += loss.item() * len(keep)
-        total_n += len(keep)
-
-    return total_loss / max(total_n, 1)
-
-
 @torch.no_grad()
 def evaluate(
-    model: nn.Module,
-    loader,
-    loss_fn: Callable,
-    device: torch.device,
-) -> float:
-    model.eval()
-    total_loss, total_n = 0.0, 0
-    for x, y, _ in loader:
-        x = move_to_device(x, device)
-        pred = model(x)
-        if isinstance(pred, tuple):
-            pred = pred[0]
-        y = y.to(device)
-        if y.ndim == 3 and y.shape[0] == 1:
-            y = y.squeeze(0)
-        if pred.ndim == 3 and pred.shape[0] == 1:
-            pred = pred.squeeze(0)
-
-        assert pred.shape == y.shape, (        # ← inside loop: correct
-            f"pred={pred.shape}, target={y.shape}"
-        )
-
-        loss = loss_fn(pred, y)
-        total_loss += loss.item() * y.shape[0]
-        total_n += y.shape[0]
-
-    return total_loss / max(total_n, 1)
-
-
-@torch.no_grad()
-def evaluate_with_pcc(
     model: nn.Module,
     loader,
     loss_fn: Callable,
@@ -247,25 +115,7 @@ def evaluate_with_pcc(
 
 
 
-def save_init_checkpoint(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    path: str | Path,
-) -> None:
-   
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        },
-        path,
-    )
-    print(f"[Checkpoint] Saved shared init to {path}")
-
-
-def curriculum_train_epoch_v2(
+def curriculum_train_epoch(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     loss_fn: Callable,
@@ -276,18 +126,7 @@ def curriculum_train_epoch_v2(
     max_grad_norm: float = 1.0,
     min_mask_fraction: float = 0.10,
 ) -> float:
-    """Train one epoch with curriculum-based spot selection.
-
-    The *difficulty_repo* dict supports two modes:
-
-    **Spot-level (original)** — ``{slide_id: np.ndarray(N_spots,)}``:
-        Select the easiest *spots* up to fraction tau.
-
-    **Niche-level (new)** — ``{slide_id: {"spot": ..., "niche": ...,
-    "niche_labels": ...}}``:
-        Select the easiest *niches* up to fraction tau; all spots in
-        an active niche are trained together.
-    """
+    
     model.train()
     total_loss, total_n = 0.0, 0
 
@@ -357,33 +196,6 @@ def curriculum_train_epoch_v2(
 
     return total_loss / max(total_n, 1)
 
-def load_init_checkpoint(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    path: str | Path,
-    device: torch.device | str = "cpu",
-) -> None:
-    
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Init checkpoint not found: {path}\n"
-            "Run save_init_checkpoint() after warm-up first."
-        )
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    print(f"[Checkpoint] Loaded shared init from {path}")
-
-
-def reset_optimizer(
-    optimizer: torch.optim.Optimizer,
-) -> None:
-  
-    optimizer.state.clear()
-    print("[Checkpoint] Optimizer state reset (momentum/variance cleared).")
-
-
 
 def train_curriculum(
     model: nn.Module,
@@ -395,7 +207,7 @@ def train_curriculum(
     cfg,
     total_epochs: int = 50,
     device: Optional[torch.device] = None,
-    init_checkpoint: Optional[str | Path] = None
+    init_checkpoint: Optional[str] = None
 ) -> Tuple[nn.Module, TrainingLog]:
 
     if device is None:
@@ -421,7 +233,7 @@ def train_curriculum(
     )
 
     for epoch in range(total_epochs):
-        val_loss, val_pcc = evaluate_with_pcc(model, val_loader, loss_fn, device)
+        val_loss, val_pcc = evaluate(model, val_loader, loss_fn, device)
 
         if val_loss < best_val:
             best_val = val_loss
@@ -431,7 +243,7 @@ def train_curriculum(
 
         # Per-slide spot selection is handled inside curriculum_train_epoch_v2
         # using difficulty_repo scores directly. No global mask needed.
-        train_loss = curriculum_train_epoch_v2(
+        train_loss = curriculum_train_epoch(
             model, optimizer, loss_fn, train_loader, difficulty_repo, tau, device,
             max_grad_norm=cfg.training.max_grad_norm,
             min_mask_fraction=cfg.curriculum.min_mask_fraction,

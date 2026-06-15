@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 from scipy.stats import pearsonr, spearmanr
 
-from .dynamics import SpatialDynamicsField
+from .difficulty_gse import SpatialDynamicsField
 from .curriculum import TrainingLog
 from .utils import move_to_device, flatten_indices
 from .utils import prepare_morans_adata, morans_i_scanpy_from_adata

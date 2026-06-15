@@ -7,9 +7,17 @@ from scipy.sparse import csr_matrix, diags
 from sklearn.neighbors import NearestNeighbors
 
 
-# ---------------------------------------------------------------------------
-# Graph construction
-# ---------------------------------------------------------------------------
+
+@dataclass
+class SpatialDynamicsField:
+   
+    coords: np.ndarray          
+    difficulty_score: np.ndarray  
+
+    @property
+    def N(self) -> int:
+        return len(self.difficulty_score)
+
 
 def build_spatial_adjacency(
     coords: np.ndarray,

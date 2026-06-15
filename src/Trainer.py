@@ -174,7 +174,7 @@ class SpatialCurriculumTrainer:
 
         for epoch in range(self.cfg.training.total_epochs):
 
-            val_loss = _evaluate(baseline_model, val_loader, loss_fn, device)
+            val_loss, val_pcc = _evaluate(baseline_model, val_loader, loss_fn, device)
 
             if val_loss < best_val:
                 best_val = val_loss
@@ -192,8 +192,9 @@ class SpatialCurriculumTrainer:
 
             if (epoch + 1) % 5 == 0 or epoch == 0:
                 print(
-                    f"  [Baseline] Epoch {epoch + 1:3d}/{self.cfg.training.total_epochs} | "
-                    f"train={train_loss:.4f} | val={val_loss:.4f}"
+                    f"  Epoch {epoch + 1:3d}/{self.cfg.training.total_epochs} | "
+                    f"train={train_loss:.4f} | val={val_loss:.4f} | "
+                    f"PCC={val_pcc:.4f} | "
                 )
 
         if best_state is not None:
