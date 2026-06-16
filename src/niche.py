@@ -359,3 +359,314 @@ def summarise_niches(
           f"mean_difficulty={stats['mean_niche_difficulty']:.3f} | "
           f"hard_frac={stats['frac_hard_niches']:.1%}")
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Niche visualisation
+# ---------------------------------------------------------------------------
+
+def plot_niche_quality(
+    expression: np.ndarray,
+    coords: np.ndarray,
+    niche_labels: np.ndarray,
+    niche_scores: np.ndarray,
+    spot_scores: np.ndarray,
+    save_path: Optional[str] = None,
+    show: bool = True,
+    figsize: Tuple[float, float] = (18, 12),
+    cmap: str = "plasma",
+    title: str = "Niche Quality Dashboard",
+) -> "matplotlib.figure.Figure":
+    """Multi-panel dashboard visualising niche quality.
+
+    Panels
+    ------
+    1. **Spatial map** — spots coloured by niche label (discrete).
+    2. **Difficulty heatmap** — spots coloured by per-spot difficulty.
+    3. **Niche composition** — bar chart of niche sizes.
+    4. **Difficulty components** — per-niche heterogeneity, topology, ambiguity.
+    5. **Spatial coherence** — histogram of neighbour-agreement per spot.
+    6. **Silhouette summary** — per-niche silhouette scores.
+
+    Parameters
+    ----------
+    expression  : (N, G) log-normalised expression.
+    coords      : (N, 2) spatial coordinates.
+    niche_labels : (N,) niche assignment per spot.
+    niche_scores : (K,) composite difficulty per niche (0–1).
+    spot_scores  : (N,) difficulty propagated to each spot.
+    save_path   : optional path to save figure.
+    show        : whether to call ``plt.show()``.
+    figsize     : figure dimensions.
+    cmap        : colour map for continuous values.
+    title       : figure suptitle.
+
+    Returns
+    -------
+    fig : matplotlib Figure.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
+
+    K = int(niche_labels.max()) + 1
+    counts = np.bincount(niche_labels, minlength=K)
+
+    # --- Compute auxiliary metrics on the fly ---
+    sil_values = _per_niche_silhouette(expression, coords, niche_labels)
+    spat_coh = _spatial_coherence_per_spot(niche_labels, coords)
+    het = niche_heterogeneity(expression, niche_labels)
+    topo = niche_topology_difficulty(niche_labels, coords, expression)
+    amb_per_spot = niche_ambiguity(expression, niche_labels)
+    amb = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
+
+    fig, axes = plt.subplots(2, 3, figsize=figsize)
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+
+    # ---- 1. Spatial map (discrete niches) ----
+    ax = axes[0, 0]
+    scatter = ax.scatter(
+        coords[:, 0], coords[:, 1], c=niche_labels, cmap="tab20",
+        s=8, alpha=0.7, edgecolors="none"
+    )
+    ax.set_title(f"Spatial Niche Map (K={K})")
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+    ax.set_aspect("equal")
+    cbar = fig.colorbar(scatter, ax=ax, ticks=range(K), shrink=0.7)
+    cbar.set_label("Niche label")
+
+    # ---- 2. Difficulty heatmap ----
+    ax = axes[0, 1]
+    norm = Normalize(vmin=spot_scores.min(), vmax=spot_scores.max())
+    sc = ax.scatter(
+        coords[:, 0], coords[:, 1], c=spot_scores, cmap=cmap,
+        s=8, alpha=0.7, edgecolors="none", norm=norm,
+    )
+    ax.set_title("Per-Spot Difficulty")
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+    ax.set_aspect("equal")
+    fig.colorbar(sc, ax=ax, shrink=0.7, label="Difficulty")
+
+    # ---- 3. Niche composition ----
+    ax = axes[0, 2]
+    colors = [plt.cm.tab20(i % 20) for i in range(K)]
+    ax.bar(range(K), counts, color=colors, edgecolor="white", linewidth=0.5)
+    ax.set_title("Niche Size Distribution")
+    ax.set_xlabel("Niche")
+    ax.set_ylabel("Spot count")
+    ax.set_xticks(range(K))
+    mean_size = counts.mean()
+    ax.axhline(mean_size, color="red", ls="--", lw=0.8, label=f"Mean = {mean_size:.0f}")
+    ax.legend(fontsize=8)
+
+    # ---- 4. Difficulty components ----
+    ax = axes[1, 0]
+    x = np.arange(K)
+    width = 0.25
+    ax.bar(x - width, het, width, label="Heterogeneity", alpha=0.8)
+    ax.bar(x, topo, width, label="Topology", alpha=0.8)
+    ax.bar(x + width, amb, width, label="Ambiguity", alpha=0.8)
+    ax.set_title("Niche Difficulty Components")
+    ax.set_xlabel("Niche")
+    ax.set_ylabel("Score")
+    ax.set_xticks(x)
+    ax.legend(fontsize=7)
+
+    # Overlay composite score as line
+    ax_twin = ax.twinx()
+    ax_twin.plot(x, niche_scores, "ko-", markersize=3, linewidth=1.2,
+                 label="Composite")
+    ax_twin.set_ylabel("Composite difficulty", fontsize=9)
+    ax_twin.legend(fontsize=7, loc="upper right")
+
+    # ---- 5. Spatial coherence histogram ----
+    ax = axes[1, 1]
+    ax.hist(spat_coh, bins=30, color="steelblue", edgecolor="white",
+            alpha=0.8, density=True)
+    ax.axvline(spat_coh.mean(), color="red", ls="--", lw=1.2,
+               label=f"Mean = {spat_coh.mean():.3f}")
+    ax.set_title("Spatial Coherence per Spot")
+    ax.set_xlabel("Fraction of neighbours sharing niche")
+    ax.set_ylabel("Density")
+    ax.legend(fontsize=8)
+
+    # ---- 6. Per-niche silhouette ----
+    ax = axes[1, 2]
+    valid = ~np.isnan(sil_values)
+    if valid.sum() > 0:
+        sil_plot = np.full(K, np.nan)
+        sil_plot[valid] = sil_values[valid]
+        ax.bar(range(K), sil_plot, color=colors, edgecolor="white", linewidth=0.5)
+        ax.axhline(0, color="gray", lw=0.5)
+        ax.set_title("Per-Niche Silhouette")
+        ax.set_xlabel("Niche")
+        ax.set_ylabel("Silhouette score")
+        ax.set_xticks(range(K))
+        mean_sil = np.nanmean(sil_values)
+        ax.axhline(mean_sil, color="red", ls="--", lw=0.8,
+                   label=f"Mean = {mean_sil:.3f}")
+        ax.legend(fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "Not enough niches\nfor silhouette (< 2)",
+                ha="center", va="center", transform=ax.transAxes, fontsize=10)
+        ax.set_title("Per-Niche Silhouette")
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"[Niche] Dashboard saved to {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig
+
+
+def plot_niche_spatial(
+    coords: np.ndarray,
+    niche_labels: np.ndarray,
+    spot_scores: Optional[np.ndarray] = None,
+    save_path: Optional[str] = None,
+    show: bool = True,
+    title: str = "Niche Spatial View",
+) -> "matplotlib.figure.Figure":
+    """Side-by-side spatial views: discrete niches vs continuous difficulty."""
+    import matplotlib.pyplot as plt
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+
+    K = int(niche_labels.max()) + 1
+
+    # Left: discrete niches
+    sc1 = ax1.scatter(
+        coords[:, 0], coords[:, 1], c=niche_labels,
+        cmap="tab20", s=10, alpha=0.7, edgecolors="none",
+    )
+    ax1.set_title(f"Niche Labels (K={K})")
+    ax1.set_xlabel("x"); ax1.set_ylabel("y")
+    ax1.set_aspect("equal")
+    cbar1 = fig.colorbar(sc1, ax=ax1, ticks=range(K), shrink=0.7)
+    cbar1.set_label("Niche")
+
+    # Right: difficulty overlay
+    if spot_scores is not None:
+        sc2 = ax2.scatter(
+            coords[:, 0], coords[:, 1], c=spot_scores,
+            cmap="plasma", s=10, alpha=0.7, edgecolors="none",
+        )
+        ax2.set_title("Spot Difficulty (composite)")
+        fig.colorbar(sc2, ax=ax2, shrink=0.7, label="Difficulty")
+    else:
+        ax2.scatter(
+            coords[:, 0], coords[:, 1], c="gray",
+            s=10, alpha=0.5, edgecolors="none",
+        )
+        ax2.set_title("Spatial Layout")
+    ax2.set_xlabel("x"); ax2.set_ylabel("y")
+    ax2.set_aspect("equal")
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig
+
+
+def plot_niche_difficulty_components(
+    niche_scores: np.ndarray,
+    heterogeneity: np.ndarray,
+    topology: np.ndarray,
+    ambiguity: np.ndarray,
+    niche_labels: Optional[np.ndarray] = None,
+    save_path: Optional[str] = None,
+    show: bool = True,
+    title: str = "Niche Difficulty Breakdown",
+) -> "matplotlib.figure.Figure":
+    """Bar chart breaking composite difficulty into its components."""
+    import matplotlib.pyplot as plt
+
+    K = len(niche_scores)
+    x = np.arange(K)
+
+    fig, ax = plt.subplots(figsize=(max(6, K * 0.4), 4.5))
+    width = 0.25
+
+    ax.bar(x - width, heterogeneity, width, label="Heterogeneity", alpha=0.85)
+    ax.bar(x, topology, width, label="Topology (boundary)", alpha=0.85)
+    ax.bar(x + width, ambiguity, width, label="Ambiguity", alpha=0.85)
+
+    ax.plot(x, niche_scores, "ko-", markersize=4, linewidth=1.5,
+            label="Composite", zorder=5)
+
+    ax.set_title(title)
+    ax.set_xlabel("Niche")
+    ax.set_ylabel("Score (normalised 0–1)")
+    ax.set_xticks(x)
+    if niche_labels is not None:
+        unique = sorted(set(niche_labels))
+        ax.set_xticklabels([f"{lbl}" for lbl in unique])
+    ax.legend(fontsize=8)
+    ax.set_ylim(0, 1.1)
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig
+
+
+def _per_niche_silhouette(
+    expression: np.ndarray,
+    coords: np.ndarray,
+    niche_labels: np.ndarray,
+    spatial_weight: float = 0.3,
+) -> np.ndarray:
+    """Mean silhouette per niche on joint [expression, space] features."""
+    from sklearn.metrics import silhouette_samples
+    from sklearn.preprocessing import StandardScaler
+
+    K = int(niche_labels.max()) + 1
+    if K < 2:
+        return np.full(K, np.nan)
+
+    exp_std = StandardScaler().fit_transform(expression)
+    coord_std = StandardScaler().fit_transform(coords)
+    joint = np.concatenate(
+        [exp_std * (1.0 - spatial_weight), coord_std * spatial_weight], axis=1
+    )
+
+    samples = silhouette_samples(joint, niche_labels)
+    sil = np.array([samples[niche_labels == k].mean() for k in range(K)])
+    return sil
+
+
+def _spatial_coherence_per_spot(
+    niche_labels: np.ndarray,
+    coords: np.ndarray,
+    k: int = 6,
+) -> np.ndarray:
+    """Fraction of k nearest neighbours sharing the same niche (per spot)."""
+    from sklearn.neighbors import NearestNeighbors
+
+    N = len(niche_labels)
+    nbrs = NearestNeighbors(n_neighbors=k + 1).fit(coords)
+    _, indices = nbrs.kneighbors(coords)
+
+    agreements = np.zeros(N, dtype=np.float32)
+    for i in range(N):
+        neighbours = indices[i, 1:]
+        agreements[i] = (niche_labels[neighbours] == niche_labels[i]).mean()
+    return agreements

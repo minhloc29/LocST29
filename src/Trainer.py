@@ -41,7 +41,7 @@ def build_difficulty_repo(
                 "niche_labels": np.ndarray [N_spots],
             }}
     """
-    from .difficulty import topological_difficulty_from_data, niche_difficulty_from_data
+    from .difficulty_gse import topological_difficulty_from_data, niche_difficulty_from_data
 
     repo = {}
 

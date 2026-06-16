@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
@@ -7,12 +8,11 @@ from scipy.sparse import csr_matrix, diags
 from sklearn.neighbors import NearestNeighbors
 
 
-
 @dataclass
 class SpatialDynamicsField:
-   
-    coords: np.ndarray          
-    difficulty_score: np.ndarray  
+    """Minimal container for spatial difficulty scores."""
+    coords: np.ndarray            # (N, 2) spatial coordinates
+    difficulty_score: np.ndarray  # (N,) higher = harder
 
     @property
     def N(self) -> int:

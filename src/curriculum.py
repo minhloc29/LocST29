@@ -16,16 +16,22 @@ from .utils import (
 
 
 class ThresholdScheduler:
-    def __init__(self, cfg, total_epochs: int):
+    def __init__(self, cfg, total_epochs: int, difficulty_repo: dict):
         self.cfg = cfg
         self.T = total_epochs
-        self.tau = cfg.curriculum.tau_start          # was cfg.tau_start
+        self.tau = cfg.curriculum.tau_start
         self._best_val = float("inf")
-        self._plateau_ct = 0
         self._epoch = 0
+        self._prev_n_active = {}  # slide_id -> number of active niches (prev epoch)
+
+        # Pre-compute total niches per slide for reporting
+        self._total_niches = {}
+        for slide_id, entry in difficulty_repo.items():
+            if isinstance(entry, dict) and "niche" in entry:
+                self._total_niches[slide_id] = len(entry["niche"])
 
     def step(self, val_loss: float) -> float:
-        if self._epoch < self.cfg.curriculum.tau_warmup_epochs:   # was cfg.tau_warmup_epochs
+        if self._epoch < self.cfg.curriculum.tau_warmup_epochs:
             frac = self._epoch / max(self.cfg.curriculum.tau_warmup_epochs, 1)
             self.tau = self.cfg.curriculum.tau_start + frac * (
                 self.cfg.curriculum.tau_end - self.cfg.curriculum.tau_start
@@ -35,9 +41,32 @@ class ThresholdScheduler:
 
         if val_loss < self._best_val:
             self._best_val = val_loss
-      
+
         self._epoch += 1
         return self.tau
+
+    def log_niche_expansion(self, slide_id: int, n_active: int) -> int:
+        """Track niche expansion. Returns number of *new* niches added this epoch."""
+        prev = self._prev_n_active.get(slide_id, 0)
+        new_niches = n_active - prev
+        self._prev_n_active[slide_id] = n_active
+        return new_niches
+
+    def print_epoch_summary(self, epoch: int, total_epochs: int,
+                            train_loss: float, val_loss: float,
+                            val_pcc: float, tau: float,
+                            niche_stats: dict) -> None:
+        """Print a detailed epoch summary including niche expansion info."""
+        parts = [
+            f"Epoch {epoch + 1:3d}/{total_epochs} | "
+            f"train={train_loss:.4f} | val={val_loss:.4f} | "
+            f"PCC={val_pcc:.4f} | tau={tau:.3f}"
+        ]
+        if niche_stats:
+            parts.append(f"niches={niche_stats['active']}/{niche_stats['total']}")
+            if niche_stats['new'] > 0:
+                parts.append(f"+{niche_stats['new']} new")
+        print("  " + " | ".join(parts))
 
 
 @dataclass
@@ -125,10 +154,20 @@ def curriculum_train_epoch(
     device: torch.device,
     max_grad_norm: float = 1.0,
     min_mask_fraction: float = 0.10,
-) -> float:
-    
+    scheduler: Optional[ThresholdScheduler] = None,
+) -> Tuple[float, dict]:
+    """Train one epoch with curriculum-based spot selection.
+
+    Returns
+    -------
+    avg_loss : float
+    niche_stats : dict
+        ``{"active": n_active_niches, "total": n_total_niches, "new": n_new_this_epoch}``
+        Empty dict if not using niche mode.
+    """
     model.train()
     total_loss, total_n = 0.0, 0
+    niche_stats = {}
 
     for x, y, idx, slide_id in loader:
         slide_id = int(slide_id)
@@ -147,8 +186,17 @@ def curriculum_train_epoch(
                     int(min_mask_fraction * n_niches),
                 )
                 # Easiest niches first
-                active_niche_idx = np.argsort(niche_scores)[:n_active]
-                active_set = set(active_niche_idx.tolist())
+                active_set = set(np.argsort(niche_scores)[:n_active].tolist())
+
+                # Track niche expansion
+                if scheduler is not None:
+                    new = scheduler.log_niche_expansion(slide_id, n_active)
+                    niche_stats = {
+                        "active": n_active,
+                        "total": n_niches,
+                        "new": new,
+                    }
+
                 keep = torch.tensor(
                     [i for i, lbl in enumerate(niche_labels) if int(lbl) in active_set],
                     dtype=torch.long,
@@ -194,7 +242,7 @@ def curriculum_train_epoch(
         total_loss += loss.item() * len(keep)
         total_n += len(keep)
 
-    return total_loss / max(total_n, 1)
+    return total_loss / max(total_n, 1), niche_stats
 
 
 def train_curriculum(
@@ -219,12 +267,23 @@ def train_curriculum(
         print(f"[Checkpoint] Loaded warm-up weights from {init_checkpoint}")
 
     model.to(device)
-    scheduler = ThresholdScheduler(cfg, total_epochs)
+    scheduler = ThresholdScheduler(cfg, total_epochs, difficulty_repo)
     log = TrainingLog()
 
     # early stopping state
     best_val = float("inf")
     best_state: Optional[dict] = None
+
+    # Summarise niche layout
+    n_niche_slides = sum(1 for v in difficulty_repo.values()
+                         if isinstance(v, dict) and "niche" in v)
+    if n_niche_slides > 0:
+        total_niches = sum(
+            len(v["niche"]) for v in difficulty_repo.values()
+            if isinstance(v, dict) and "niche" in v
+        )
+        print(f"  Niche-level curriculum: {n_niche_slides} slide(s), "
+              f"{total_niches} niches total")
 
     print(f"Starting curriculum training for {total_epochs} epochs...")
     print(
@@ -241,22 +300,18 @@ def train_curriculum(
 
         tau = scheduler.step(val_loss)
 
-        # Per-slide spot selection is handled inside curriculum_train_epoch_v2
-        # using difficulty_repo scores directly. No global mask needed.
-        train_loss = curriculum_train_epoch(
+        train_loss, niche_stats = curriculum_train_epoch(
             model, optimizer, loss_fn, train_loader, difficulty_repo, tau, device,
             max_grad_norm=cfg.training.max_grad_norm,
             min_mask_fraction=cfg.curriculum.min_mask_fraction,
+            scheduler=scheduler,
         )
 
         log.log(train_loss, val_loss, tau, np.zeros(1), pcc=val_pcc)
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(
-                f"  Epoch {epoch + 1:3d}/{total_epochs} | "
-                f"train={train_loss:.4f} | val={val_loss:.4f} | "
-                f"PCC={val_pcc:.4f} | "
-                f"tau={tau:.3f}"
+            scheduler.print_epoch_summary(
+                epoch, total_epochs, train_loss, val_loss, val_pcc, tau, niche_stats
             )
 
     # restore best weights

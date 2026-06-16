@@ -10,7 +10,7 @@ from pathlib import Path
 
 from config.my_config import load_config
 from src import DataConfig, load_dataset
-from src.difficulty_gse import topological_difficulty_from_data, SpatialDynamicsField
+from src.difficulty_gse import topological_difficulty_from_data
 
 def main():
     parser = argparse.ArgumentParser()

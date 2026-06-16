@@ -92,6 +92,103 @@ def compute_error_vector(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
     target_X = np.asarray(target_X)
     return np.mean((pred_X - target_X) ** 2, axis=1)
 
+def build_difficulty_field(
+    expression: np.ndarray,
+    coords: np.ndarray,
+    # --- Niche construction ---
+    method: str = "spatial_leiden",
+    resolution: float = 1.0,
+    n_niches: Optional[int] = None,
+    spatial_weight: float = 0.3,
+    n_neighbors: int = 10,
+    # --- Niche difficulty weights ---
+    alpha: float = 0.40,   # heterogeneity
+    beta: float = 0.30,    # topology / boundary energy
+    gamma: float = 0.15,   # ambiguity
+    delta: float = 0.15,   # uncertainty (ignored here — no training dynamics)
+    # --- GSE blend ---
+    use_gse: bool = True,
+    gse_alpha: float = 0.5,
+    k_neighbours: int = 6,
+    random_state: int = 42,
+) -> SpatialDynamicsField:
+    """
+    Build a DifficultyField from raw expression and coordinates.
+
+    Pipeline
+    --------
+    1. Build spatial niches (Leiden / Louvain / K-means on joint features)
+    2. Compute per-niche difficulty (heterogeneity + topology + ambiguity)
+    3. Propagate niche scores to spots
+    4. Optionally blend with Graph Signal Energy (GSE) for boundary sharpness
+    5. Return DifficultyField with difficulty_score (N,) and coords (N, 2)
+
+    Parameters
+    ----------
+    expression    : (N, G) log-normalized gene expression
+    coords        : (N, 2) pixel / spatial coordinates
+    method        : niche construction method
+    resolution    : Leiden resolution (larger → more niches)
+    n_niches      : fixed K for K-means; ignored for Leiden/Louvain
+    spatial_weight: weight of coords vs expression in joint clustering space
+    n_neighbors   : k-NN neighbors for graph construction in Leiden
+    alpha         : weight for niche heterogeneity
+    beta          : weight for niche topology (Laplacian boundary energy)
+    gamma         : weight for niche ambiguity
+    delta         : weight for training-dynamics uncertainty (set to 0 here)
+    use_gse       : if True, blend spot_scores with graph signal energy
+    gse_alpha     : blend weight (gse_alpha * niche_score + (1-gse_alpha) * boundary_energy)
+    k_neighbours  : spatial graph k for GSE boundary computation
+    random_state  : random seed for clustering
+
+    Returns
+    -------
+    DifficultyField with .difficulty_score (N,), .coords (N, 2), .N
+    """
+    expression = np.nan_to_num(np.asarray(expression, dtype=np.float32), nan=0.0)
+    coords = np.asarray(coords, dtype=np.float64)
+
+    print(f"[DifficultyField] Building niches: N={len(expression)}, G={expression.shape[1]}, "
+          f"method={method}, resolution={resolution}")
+
+    # Step 1 + 2 + 3: niches → per-niche scores → spot scores
+    niche_labels, niche_scores, spot_scores = niche_difficulty_from_data(
+        expression=expression,
+        coords=coords,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        delta=0.0,          # no training dynamics available here
+        method=method,
+        resolution=resolution,
+        n_niches=n_niches,
+        spatial_weight=spatial_weight,
+    )
+
+    print(f"[DifficultyField] Niches built: K={len(niche_scores)} | "
+          f"spot_scores: min={spot_scores.min():.4f} max={spot_scores.max():.4f} "
+          f"mean={spot_scores.mean():.4f}")
+
+    # Step 4: optionally blend with GSE for sharper boundary signal
+    if use_gse:
+        from .difficulty_gse import graph_signal_energy_difficulty
+        gse_scores = graph_signal_energy_difficulty(
+            base_score=spot_scores,
+            coords=coords,
+            k=k_neighbours,
+            alpha=gse_alpha,
+            weight="binary",
+        )
+        final_scores = gse_scores
+        print(f"[DifficultyField] GSE blend applied: alpha={gse_alpha} | "
+              f"final: min={final_scores.min():.4f} max={final_scores.max():.4f}")
+    else:
+        final_scores = spot_scores
+
+    return SpatialDynamicsField(
+        difficulty_score=final_scores.astype(np.float32),
+        coords=coords.astype(np.float32),
+    )
 
 def convergence_speed(log: TrainingLog, threshold: float = 0.05) -> int:
     """
@@ -953,3 +1050,139 @@ def run_evaluation(
 
     report.print_summary()
     return report
+
+
+if __name__ == "__main__":
+    """CLI: evaluate trained curriculum & baseline models on test data.
+
+    Usage
+    -----
+    python -m src.evaluation \\
+        --checkpoint_dir ./outputs/run1 \\
+        --config ./configs/my_config.yaml
+
+    This loads the curriculum model and baseline model from the checkpoint
+    directory, runs inference on the test set, computes all evaluation
+    metrics (MSE, PCC, MAE, difficulty bins, paper RQ1-RQ4 metrics), and
+    prints a summary.
+    """
+    import argparse
+    import json
+    from pathlib import Path
+    from importlib import import_module
+
+    from torch.utils.data import DataLoader
+
+    from src import (
+        DataConfig,
+        SpatialModelAdapter,
+        MultiSlideAdapter,
+        build_slide_loader,
+        load_dataset,
+        prepare_phase1,
+    )
+    from config.my_config import load_config
+
+    parser = argparse.ArgumentParser(description="Evaluate trained curriculum models")
+    parser.add_argument("--checkpoint_dir", type=str, required=True,
+                        help="Directory containing curriculum_model.pt and baseline_model.pt")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to training config YAML")
+    parser.add_argument("--output_json", type=str, default=None,
+                        help="Optional path to save results as JSON")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    device = torch.device(cfg.training.device)
+    ckpt_dir = Path(args.checkpoint_dir)
+
+    # ── Build model ──
+    def _build_model(module_path, class_name, kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        elif hasattr(kwargs, "__dict__"):
+            kwargs = vars(kwargs)
+        cls = getattr(import_module(module_path), class_name)
+        return cls(**kwargs)
+
+    model = _build_model(cfg.model.module, cfg.model.class_name, cfg.model.kwargs)
+    baseline_model = _build_model(cfg.model.module, cfg.model.class_name, cfg.model.kwargs)
+    if cfg.pipeline.wrap_model:
+        model = SpatialModelAdapter(model)
+        baseline_model = SpatialModelAdapter(baseline_model)
+
+    # ── Load checkpoints ──
+    ckpt_path = ckpt_dir / "curriculum_model.pt"
+    base_ckpt_path = ckpt_dir / "baseline_model.pt"
+    if ckpt_path.exists():
+        model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+        print(f"[Eval] Loaded curriculum model from {ckpt_path}")
+    else:
+        print(f"[Eval] WARNING: {ckpt_path} not found — using random weights")
+    if base_ckpt_path.exists():
+        baseline_model.load_state_dict(torch.load(base_ckpt_path, map_location="cpu"))
+        print(f"[Eval] Loaded baseline model from {base_ckpt_path}")
+    else:
+        print(f"[Eval] WARNING: {base_ckpt_path} not found — using random weights")
+
+    model.to(device)
+    baseline_model.to(device)
+
+    # ── Build dataset & loader ──
+    data_root = Path(cfg.dataset.data_root).resolve() if cfg.dataset.data_root else None
+    data_cfg = DataConfig(
+        dataset=cfg.dataset.name, fold=cfg.dataset.fold,
+        adj=True, flatten=cfg.dataset.flatten, data_root=data_root,
+    )
+    test_base = load_dataset(data_cfg, train=False)
+    if len(test_base.names) == 0:
+        test_base = load_dataset(data_cfg, train=True)
+        print("[Eval] No test set — using training set for evaluation")
+    test_loader = build_slide_loader(
+        test_base, slide_index=cfg.dataset.test_slide_index,
+        batch_size=cfg.training.batch_size, num_workers=cfg.training.num_workers,
+    )
+
+    # ── Get data for field construction ──
+    slide_name = test_base.names[cfg.dataset.test_slide_index]
+    expression = test_base.exp_dict[slide_name]
+    coords = test_base.center_dict[slide_name].astype(float)
+
+    field = build_difficulty_field(
+        expression=np.nan_to_num(expression, nan=0.0),
+        coords=coords,
+        k_neighbours=cfg.difficulty.k_neighbours,
+    )
+
+    # ── Run evaluation ──
+    report = run_evaluation(
+        curriculum_model=model,
+        baseline_model=baseline_model,
+        test_loader=test_loader,
+        field=field,
+        training_log=TrainingLog(),  # empty log — metrics that need it (AULC) will show nan
+        device=device,
+    )
+
+    # ── Save results (optional) ──
+    if args.output_json:
+        from dataclasses import asdict
+        output = asdict(report)
+        # Convert numpy arrays / floats to plain Python types
+        def _convert(obj):
+            if isinstance(obj, dict):
+                return {k: _convert(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_convert(v) for v in obj]
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
+        output = _convert(output)
+        (ckpt_dir / args.output_json).write_text(
+            json.dumps(output, indent=2, default=str)
+        )
+        print(f"[Eval] Results saved to {ckpt_dir / args.output_json}")
