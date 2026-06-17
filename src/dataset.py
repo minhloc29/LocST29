@@ -16,8 +16,8 @@ from torch.utils.data import DataLoader, Dataset
 from PIL import Image, ImageFile
 from scipy.spatial import distance
 
-from .utils import Phase1Results, prepare_morans_adata, morans_i_scanpy_from_adata
-from .utils import move_to_device, flatten_indices, _resolve_data_root, _require_dir, calc_adj
+from src.utils import Phase1Results, prepare_morans_adata, morans_i_scanpy_from_adata
+from src.utils import move_to_device, flatten_indices, _resolve_data_root, _require_dir, calc_adj
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None

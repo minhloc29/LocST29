@@ -6,3 +6,11 @@ python train.py --dataset her2st --model-module src.models.hist2st --model-class
 
 
 python train.py --config config/config.yaml
+
+
+python -m scripts.niche_quality_analysis --checkpoint runs/run1/curriculum_model.pt
+
+
+python src/evaluation.py --checkpoint_dir ./runs/run2 --config config/config.yaml --output_json report.json
+
+$env:PYTHONPATH="C:\Users\BKAI\locodo\spatial_curriculum"

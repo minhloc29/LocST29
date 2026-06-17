@@ -16,8 +16,8 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_distances, euclidean_distances
 from sklearn.neighbors import NearestNeighbors
-
-from .difficulty_gse import build_spatial_adjacency, graph_laplacian
+from sklearn.decomposition import PCA
+from src.difficulty_gse import build_spatial_adjacency, graph_laplacian
 
 
 # ---------------------------------------------------------------------------
@@ -63,14 +63,14 @@ def build_spatial_niches(
     coord_std = (coords - coords.mean(axis=0, keepdims=True)) / (
         coords.std(axis=0, keepdims=True) + 1e-10
     )
+    n_pcs = min(30, exp_std.shape[1])
 
-    # --- Joint features ---
-    joint = np.concatenate(
-        [exp_std * (1.0 - spatial_weight), coord_std * spatial_weight], axis=1
-    )
+    exp_pca = PCA(n_components=n_pcs, random_state=random_state).fit_transform(exp_std)
+
+    joint = np.concatenate([exp_pca * (1.0 - spatial_weight), coord_std * spatial_weight], axis=1)
 
     if method == "spatial_leiden":
-        return _niches_via_leiden(joint, resolution, n_neighbors, random_state)
+        return _niches_via_leiden(joint, coord_std, resolution, n_neighbors, random_state)
     elif method == "spatial_kmeans":
         K = n_niches if n_niches is not None else min(20, N // 5)
         labels = KMeans(
@@ -78,7 +78,7 @@ def build_spatial_niches(
         ).fit_predict(joint)
         return labels.astype(np.int32)
     elif method == "louvain":
-        return _niches_via_leiden(joint, resolution, n_neighbors, random_state,
+        return _niches_via_leiden(joint, coord_std, resolution, n_neighbors, random_state,
                                   use_louvain=True)
     else:
         raise ValueError(f"Unknown niche method: {method}")
@@ -86,6 +86,7 @@ def build_spatial_niches(
 
 def _niches_via_leiden(
     joint: np.ndarray,
+    coord_std,
     resolution: float,
     n_neighbors: int,
     random_state: int,
@@ -262,76 +263,40 @@ def niche_ambiguity(
 # ---------------------------------------------------------------------------
 
 def compute_niche_difficulty(
-    expression: np.ndarray,
-    coords: np.ndarray,
-    niche_labels: np.ndarray,
-    alpha: float = 0.40,
-    beta: float = 0.30,
-    gamma: float = 0.15,
-    delta: float = 0.15,
-    niche_dynamics_uncertainty: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute composite difficulty at the niche level.
-
-    Parameters
-    ----------
-    expression  : (N, G) log-normalized gene expression.
-    coords      : (N, 2) spatial coordinates.
-    niche_labels : (N,) niche assignment per spot.
-    alpha       : weight for niche *heterogeneity*.
-    beta        : weight for niche *topology* (boundary energy).
-    gamma       : weight for niche *ambiguity*.
-    delta       : weight for *uncertainty* from training dynamics (optional).
-    niche_dynamics_uncertainty : (K,) optional uncertainty from training.
-
-    Returns
-    -------
-    niche_scores : (K,) difficulty per niche (0–1, higher = harder).
-    spot_scores  : (N,) difficulty propagated to each spot.
-    """
+    expression, coords, niche_labels,
+    alpha=0.3, beta=0.0, gamma=0.7, delta=0.0,
+    niche_dynamics_uncertainty=None,
+    use_spot_level_ambiguity=True,   # NEW flag
+):
     K = int(niche_labels.max()) + 1
-
-    # 1. Heterogeneity
     het = niche_heterogeneity(expression, niche_labels)
-
-    # 2. Topology
     topo = niche_topology_difficulty(niche_labels, coords, expression)
-
-    # 3. Ambiguity — aggregate per-niche mean
     amb_per_spot = niche_ambiguity(expression, niche_labels)
-    amb = np.zeros(K, dtype=np.float32)
-    for k in range(K):
-        mask = niche_labels == k
-        amb[k] = amb_per_spot[mask].mean()
 
-    # 4. Normalise each component to [0, 1]
-    def _norm(x: np.ndarray) -> np.ndarray:
+    def _norm(x):
         lo, hi = x.min(), x.max()
-        if hi - lo < 1e-10:
-            return np.zeros_like(x, dtype=np.float32)
-        return ((x - lo) / (hi - lo)).astype(np.float32)
+        return np.zeros_like(x, dtype=np.float32) if hi - lo < 1e-10 else ((x - lo) / (hi - lo)).astype(np.float32)
 
     het_n = _norm(het)
     topo_n = _norm(topo)
-    amb_n = _norm(amb)
 
-    # 5. Weighted combination
-    niche_scores = alpha * het_n + beta * topo_n + gamma * amb_n
+    # Niche-level score (for heterogeneity + topology only)
+    niche_scores = alpha * het_n + beta * topo_n
+    # broadcast the niche-level part to spots
+    spot_scores = np.array([niche_scores[int(lbl)] for lbl in niche_labels], dtype=np.float32)
 
-    if niche_dynamics_uncertainty is not None:
-        unc_n = _norm(niche_dynamics_uncertainty)
-        # Renormalise weights
-        total = alpha + beta + gamma + delta
-        niche_scores = (
-            (alpha / total) * het_n
-            + (beta / total) * topo_n
-            + (gamma / total) * amb_n
-            + (delta / total) * unc_n
-        )
-
-    # 6. Propagate to spots
-    spot_scores = np.array([niche_scores[int(lbl)] for lbl in niche_labels],
-                           dtype=np.float32)
+    if use_spot_level_ambiguity:
+        # NEW: add spot-level ambiguity directly, no niche averaging
+        amb_n_spot = _norm(amb_per_spot)
+        spot_scores = spot_scores + gamma * amb_n_spot
+        # also compute a niche-level mean for reporting/dashboard purposes only
+        amb_niche_mean = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
+        niche_scores = niche_scores + gamma * _norm(amb_niche_mean)
+    else:
+        amb = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
+        amb_n = _norm(amb)
+        niche_scores = niche_scores + gamma * amb_n
+        spot_scores = spot_scores + gamma * amb_n[niche_labels]
 
     return niche_scores, spot_scores
 
@@ -633,6 +598,7 @@ def _per_niche_silhouette(
     coords: np.ndarray,
     niche_labels: np.ndarray,
     spatial_weight: float = 0.3,
+    random_state = 42
 ) -> np.ndarray:
     """Mean silhouette per niche on joint [expression, space] features."""
     from sklearn.metrics import silhouette_samples
@@ -644,9 +610,11 @@ def _per_niche_silhouette(
 
     exp_std = StandardScaler().fit_transform(expression)
     coord_std = StandardScaler().fit_transform(coords)
-    joint = np.concatenate(
-        [exp_std * (1.0 - spatial_weight), coord_std * spatial_weight], axis=1
-    )
+    n_pcs = min(30, exp_std.shape[1])
+
+    exp_pca = PCA(n_components=n_pcs, random_state=random_state).fit_transform(exp_std)
+
+    joint = np.concatenate([exp_pca * (1.0 - spatial_weight), coord_std * spatial_weight], axis=1)
 
     samples = silhouette_samples(joint, niche_labels)
     sil = np.array([samples[niche_labels == k].mean() for k in range(K)])

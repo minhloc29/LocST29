@@ -2,9 +2,9 @@ dataset:
 
   name: her2st
   data_root: null
-  fold: 0
+  fold: 9
   train_slide_index: 0
-  test_slide_index: 0
+  test_slide_index: 2
   flatten: false
 
 training:
@@ -13,7 +13,7 @@ training:
   batch_size: 1
   num_workers: 0
   lr: 0.00001
-  seed: 40
+  seed: 42
   device: cuda
   max_grad_norm: 1.0
 
@@ -32,26 +32,22 @@ niche:
 
   enabled: true                # true → niche-level difficulty; false → spot-level
   method: "spatial_leiden"     # "spatial_leiden" | "spatial_kmeans" | "louvain"
-  resolution: 1.0              # Leiden resolution (larger → more niches)
-  spatial_weight: 0.3          # weight for spatial coords in joint feature space
+  resolution: 2.0            # Leiden resolution (larger → more niches)
+  spatial_weight: 0.3   # weight for spatial coords in joint feature space
 
   # Niche difficulty component weights (must sum to 1.0 for the formula below)
   # D_niche = alpha * heterogeneity + beta * topology + gamma * ambiguity
-  alpha: 0.40
-  beta: 0.30
-  gamma: 0.15
-  delta: 0.15                  # reserved for training-dynamics uncertainty
+  alpha: 0.5
+  beta: 0.0
+  gamma: 0.5
+  delta: 0.0                # reserved for training-dynamics uncertainty
 
 
 difficulty:
 
-  k_neighbours: 6
+  k_neighbours: 20
   n_clusters: 4
-  learn_threshold: 0.30
   hard_percentile: 0.80
-  interface_pct: 0.15
-  dbscan_eps: 50
-  max_never_learned_frac: 0.20
 
 curriculum:
 
@@ -61,13 +57,8 @@ curriculum:
   tau_warmup_epochs: 100
   stability_weight: 0.50
   min_mask_fraction: 0.10
+  patience: 3
 
-
-graph:
-
-  k_neighbors: 6
-  graph_diffusion_steps: 1
-  graph_expansion_hops: 1
 
 checkpoint:
 
@@ -77,4 +68,4 @@ checkpoint:
 pipeline:
 
   wrap_model: true
-  output_dir: "./runs/run1"
+  output_dir: "./runs/run2"

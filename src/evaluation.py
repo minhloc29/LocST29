@@ -6,12 +6,62 @@ import torch.nn as nn
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 from scipy.stats import pearsonr, spearmanr
+import matplotlib.pyplot as plt
+from src.difficulty_gse import SpatialDynamicsField, niche_difficulty_from_data, graph_signal_energy_difficulty
+from src.curriculum import TrainingLog
+from src.utils import move_to_device, flatten_indices
+from src.niche import niche_heterogeneity, niche_topology_difficulty, niche_ambiguity, build_spatial_niches
 
-from .difficulty_gse import SpatialDynamicsField
-from .curriculum import TrainingLog
-from .utils import move_to_device, flatten_indices
-from .utils import prepare_morans_adata, morans_i_scanpy_from_adata
+from src.utils import prepare_morans_adata, morans_i_scanpy_from_adata
+import os
 
+def component_wise_difficulty_correlation(
+    expression: np.ndarray,
+    coords: np.ndarray,
+    niche_labels: np.ndarray,
+    per_spot_error: np.ndarray,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Correlate each RAW niche-difficulty component (heterogeneity, topology,
+    ambiguity) against actual per-spot prediction error, independently of
+    the composite weighting (alpha/beta/gamma).
+
+    This isolates which component actually carries predictive signal,
+    rather than testing only the final weighted score.
+    """
+
+    K = int(niche_labels.max()) + 1
+
+    het = niche_heterogeneity(expression, niche_labels)
+    topo = niche_topology_difficulty(niche_labels, coords, expression)
+    amb_per_spot = niche_ambiguity(expression, niche_labels)
+    amb = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
+
+    # Propagate niche-level components to spots
+    spot_het = np.array([het[lbl] for lbl in niche_labels])
+    spot_topo = np.array([topo[lbl] for lbl in niche_labels])
+    spot_amb = amb_per_spot  # already per-spot
+
+    results = {}
+    for name, vals in [
+        ("heterogeneity", spot_het),
+        ("topology", spot_topo),
+        ("ambiguity", spot_amb),
+    ]:
+        if vals.std() < 1e-8:
+            results[name] = {"pearson": float("nan"), "spearman": float("nan"),
+                             "note": "near-constant, no discriminative signal"}
+            continue
+        r_pearson, _ = pearsonr(vals, per_spot_error)
+        r_spearman, _ = spearmanr(vals, per_spot_error)
+        results[name] = {
+            "pearson": float(r_pearson),
+            "spearman": float(r_spearman),
+            "value_range": [float(vals.min()), float(vals.max())],
+            "value_std": float(vals.std()),
+        }
+
+    return results
 
 def pearson_correlation_coefficient(
     pred: np.ndarray,
@@ -107,7 +157,7 @@ def build_difficulty_field(
     gamma: float = 0.15,   # ambiguity
     delta: float = 0.15,   # uncertainty (ignored here — no training dynamics)
     # --- GSE blend ---
-    use_gse: bool = True,
+    use_gse: bool = False,
     gse_alpha: float = 0.5,
     k_neighbours: int = 6,
     random_state: int = 42,
@@ -171,7 +221,7 @@ def build_difficulty_field(
 
     # Step 4: optionally blend with GSE for sharper boundary signal
     if use_gse:
-        from .difficulty_gse import graph_signal_energy_difficulty
+        from src.difficulty_gse import graph_signal_energy_difficulty
         gse_scores = graph_signal_energy_difficulty(
             base_score=spot_scores,
             coords=coords,
@@ -184,21 +234,47 @@ def build_difficulty_field(
               f"final: min={final_scores.min():.4f} max={final_scores.max():.4f}")
     else:
         final_scores = spot_scores
+        
+    save_path="difficulty_map.png"
+    title="Spatial Difficulty Map"
 
+    plt.figure(figsize=(6, 6))
+
+    plt.scatter(
+        coords[:, 0],
+        coords[:, 1],
+        c=final_scores.astype(np.float32),
+        cmap="hot",
+        s=25,
+        edgecolors="none"
+    )
+
+    plt.colorbar(label="Difficulty Score")
+
+    plt.title(title)
+    plt.xlabel("X")
+    plt.ylabel("Y")
+
+    # ST coordinates usually come from image space
+    plt.gca().invert_yaxis()
+
+    plt.tight_layout()
+
+    plt.savefig(
+        save_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    print(f"[Saved] Difficulty map -> {save_path}")
+    
     return SpatialDynamicsField(
         difficulty_score=final_scores.astype(np.float32),
         coords=coords.astype(np.float32),
-    )
+    ), niche_labels
 
-def convergence_speed(log: TrainingLog, threshold: float = 0.05) -> int:
-    """
-    Epoch at which validation loss first drops within threshold of its minimum.
-    Returns total_epochs if never reached.
-    """
-    vals = np.array(log.val_loss)
-    target = vals.min() + threshold * (vals.max() - vals.min())
-    idx = np.where(vals <= target)[0]
-    return int(idx[0]) if len(idx) > 0 else len(vals)
 
 
 def per_region_metrics(
@@ -454,6 +530,34 @@ def difficulty_error_correlation(
         mask = (difficulty_score >= lo) & (difficulty_score < hi) if q_high < 100 else (difficulty_score >= lo) & (difficulty_score <= hi)
         if mask.sum() > 0:
             print(f"    {label}: n={mask.sum():>4}  mean_err={per_spot_error[mask].mean():.4f}  mean_ds={difficulty_score[mask].mean():.4f}")
+            
+    
+    import os
+
+    save_dir = "evaluation_plots"
+    os.makedirs(save_dir, exist_ok=True)
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(
+        difficulty_score,
+        per_spot_error,
+        alpha=0.6,
+        s=15
+    )
+
+    plt.xlabel("Difficulty Score")
+    plt.ylabel("Per-Spot Error")
+    plt.title("Difficulty vs Prediction Error")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(save_dir, "difficulty_vs_error.png"),
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close()
     r_pearson, _ = pearsonr(difficulty_score, per_spot_error)
     r_spearman, _ = spearmanr(difficulty_score, per_spot_error)
     print(f"  [DEBUG corr] pearson={r_pearson:.4f}  spearman={r_spearman:.4f}")
@@ -648,7 +752,6 @@ class EvaluationReport:
     baseline_MSE: float
     baseline_MAE: float
     calibration_error: float
-    convergence_epoch: int
     hard_region_metrics: Dict[str, float] = field(default_factory=dict)
     biological_overlaps: Dict[str, float] = field(default_factory=dict)
     spatial_error_autocorr: Optional["SpatialAutocorrReport"] = None
@@ -657,6 +760,7 @@ class EvaluationReport:
     niche_stratified: Dict[str, Dict[str, float]] = field(default_factory=dict)
     niche_boundary: Dict[str, float] = field(default_factory=dict)
     per_niche: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    component_correlations: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
     def print_summary(self) -> None:
         print("\n" + "=" * 60)
@@ -673,7 +777,6 @@ class EvaluationReport:
             delta = c_val - b_val
             print(f"   {m:<22} {c_val:>12.4f}  {b_val:>12.4f}  {delta:>+10.4f}")
         print(f"   {'Calibration Err down':<22} {self.calibration_error:>12.4f}")
-        print(f"   {'Convergence Epoch down':<22} {self.convergence_epoch:>12d}")
 
         if self.hard_region_metrics:
             print("\n2. BOUNDARY / HARD REGION PERFORMANCE")
@@ -976,6 +1079,8 @@ def run_evaluation(
     field: SpatialDynamicsField,
     training_log: TrainingLog,
     device: torch.device,
+    expression: np.ndarray,           # NEW — required for component correlation
+    niche_labels: np.ndarray,         # NEW — required for component correlation
     bio_annotations: Optional[BiologicalAnnotations] = None,
     hard_percentile: float = 75.0,
     spatial_autocorr: bool = False,
@@ -990,6 +1095,8 @@ def run_evaluation(
 ) -> EvaluationReport:
 
     N = field.N
+    coords = field.coords    # NEW — get coords from field, don't need a separate param
+
     print("[Phase 5] Running inference on curriculum model...")
     cp, ct, ci = predict_all(curriculum_model, test_loader, device)
     cp = reorder_by_spot(cp, ci, N)
@@ -1009,7 +1116,6 @@ def run_evaluation(
         baseline_MSE=mse(bp, bt),
         baseline_MAE=mae(bp, bt),
         calibration_error=calibration_error(cp, ct),
-        convergence_epoch=convergence_speed(training_log),
     )
 
     print("[Phase 5] Evaluating hard / boundary regions...")
@@ -1026,27 +1132,35 @@ def run_evaluation(
     if spatial_autocorr:
         print("[Phase 5] Computing spatial autocorrelation of errors...")
         report.spatial_error_autocorr, _ = spatial_error_autocorrelation(
-            cp,
-            ct,
-            field.coords,
-            k_neighbours=k_neighbours,
-            n_perm=n_perm,
-            n_shuffles=n_shuffles,
+            cp, ct, coords,
+            k_neighbours=k_neighbours, n_perm=n_perm, n_shuffles=n_shuffles,
         )
 
     print("[Phase 5] Computing paper metrics (RQ1–RQ4)...")
     report.paper_metrics = compute_paper_metrics(
-        pred_curriculum=cp,
-        pred_baseline=bp,
-        target=ct,
-        field=field,
-        topology=topology,
+        pred_curriculum=cp, pred_baseline=bp, target=ct,
+        field=field, topology=topology,
         training_log_curriculum=training_log,
         epoch_pccs_curriculum=epoch_pccs_curriculum,
         training_log_baseline=training_log_baseline,
         epoch_pccs_baseline=epoch_pccs_baseline,
         pcc_threshold=pcc_threshold,
     )
+
+    # --- Component-wise correlation (now expression/coords/niche_labels in scope) ---
+    print("[Phase 5] Computing per-component difficulty correlation...")
+    per_spot_error = compute_error_vector(cp, ct)   # compute once, reuse
+
+    component_corr = component_wise_difficulty_correlation(
+        expression=expression,
+        coords=coords,
+        niche_labels=niche_labels,
+        per_spot_error=per_spot_error,
+    )
+    for name, stats in component_corr.items():
+        print(f"  {name:<15} pearson={stats.get('pearson', float('nan')):.4f} "
+              f"spearman={stats.get('spearman', float('nan')):.4f}")
+    report.component_correlations = component_corr
 
     report.print_summary()
     return report
@@ -1148,20 +1262,23 @@ if __name__ == "__main__":
     expression = test_base.exp_dict[slide_name]
     coords = test_base.center_dict[slide_name].astype(float)
 
-    field = build_difficulty_field(
+    field, niche_labels = build_difficulty_field(
         expression=np.nan_to_num(expression, nan=0.0),
         coords=coords,
         k_neighbours=cfg.difficulty.k_neighbours,
     )
-
-    # ── Run evaluation ──
+    
+    
+    
     report = run_evaluation(
         curriculum_model=model,
         baseline_model=baseline_model,
         test_loader=test_loader,
         field=field,
-        training_log=TrainingLog(),  # empty log — metrics that need it (AULC) will show nan
+        training_log=TrainingLog(),
         device=device,
+        expression=np.nan_to_num(expression, nan=0.0),   # NEW
+        niche_labels=niche_labels,                         # NEW
     )
 
     # ── Save results (optional) ──

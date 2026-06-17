@@ -6,7 +6,7 @@ import torch.nn as nn
 from dataclasses import dataclass, field
 from typing import Optional, List, Callable, Tuple
 
-from .utils import (
+from src.utils import (
     move_to_device,
     flatten_indices,
     select_active_inputs,
@@ -31,16 +31,23 @@ class ThresholdScheduler:
                 self._total_niches[slide_id] = len(entry["niche"])
 
     def step(self, val_loss: float) -> float:
+        if val_loss < self._best_val - 1e-4:
+            self._best_val = val_loss
+            self._plateau_ct = 0
+        else:
+            self._plateau_ct += 1
+
         if self._epoch < self.cfg.curriculum.tau_warmup_epochs:
             frac = self._epoch / max(self.cfg.curriculum.tau_warmup_epochs, 1)
             self.tau = self.cfg.curriculum.tau_start + frac * (
                 self.cfg.curriculum.tau_end - self.cfg.curriculum.tau_start
             )
+        elif self._plateau_ct >= self.cfg.curriculum.patience:
+            # Accelerate curriculum if stuck on plateau — introduce harder niches faster
+            self.tau = min(self.tau + 0.05, self.cfg.curriculum.tau_end)
+            self._plateau_ct = 0
         else:
             self.tau = self.cfg.curriculum.tau_end
-
-        if val_loss < self._best_val:
-            self._best_val = val_loss
 
         self._epoch += 1
         return self.tau

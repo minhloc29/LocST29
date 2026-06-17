@@ -34,3 +34,5 @@ results/
 wandb/
 logs/
 tensorboard/
+
+.png

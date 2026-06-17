@@ -6,8 +6,8 @@ import numpy as np
 import torch
 import anndata as ad
 
-from .utils import Phase1Results, build_spatial_graph, normalise_difficulty, smooth_on_graph
-from .utils import move_to_device, flatten_indices
+from src.utils import Phase1Results, build_spatial_graph, normalise_difficulty, smooth_on_graph
+from src.utils import move_to_device, flatten_indices
 
 
 @dataclass

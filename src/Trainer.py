@@ -8,8 +8,8 @@ import torch.nn as nn
 from pathlib import Path
 from typing import Optional, Callable, Tuple
 
-from .utils import Phase1Results, _seed_everything, move_to_device
-from .curriculum import (
+from src.utils import Phase1Results, _seed_everything, move_to_device
+from src.curriculum import (
     train_curriculum, TrainingLog,
     evaluate as _evaluate,
 )
@@ -243,12 +243,6 @@ class SpatialCurriculumTrainer:
             use_niches=use_niches,
             niche_cfg=self.cfg.niche if use_niches else None,
         )
-
-        # ── Step 2: baseline (full-data, no curriculum) ──
-        self.baseline_model, self._baseline_log = self.train_baseline(
-            baseline_model, baseline_optimizer, loss_fn, train_loader, val_loader,
-        )
-
         # ── Step 3: curriculum training ──
         self.model, self._training_log = train_curriculum(
             self.model, self.optimizer, loss_fn,
@@ -259,6 +253,12 @@ class SpatialCurriculumTrainer:
             init_checkpoint=self.cfg.checkpoint.init_checkpoint,
         )
 
+        # ── Step 2: baseline (full-data, no curriculum) ──
+        self.baseline_model, self._baseline_log = self.train_baseline(
+            baseline_model, baseline_optimizer, loss_fn, train_loader, val_loader,
+        )
+
+        
         return {
             "model": self.model,
             "baseline_model": self.baseline_model,
