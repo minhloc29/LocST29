@@ -11,18 +11,142 @@ rather than individual spots.
 from __future__ import annotations
 
 from typing import Optional, Tuple
-
+from dataclasses import dataclass
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_distances, euclidean_distances
 from sklearn.neighbors import NearestNeighbors
 from sklearn.decomposition import PCA
-from src.difficulty_gse import build_spatial_adjacency, graph_laplacian
+from scipy.sparse import csr_matrix, diags
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 
 
-# ---------------------------------------------------------------------------
-# Niche construction
-# ---------------------------------------------------------------------------
+@dataclass
+class SpatialDynamicsField:
+
+    coords: np.ndarray            # (N, 2) spatial coordinates
+    difficulty_score: np.ndarray  # (N,) higher = harder
+
+    @property
+    def N(self) -> int:
+        return len(self.difficulty_score)
+
+def build_spatial_adjacency(
+    coords: np.ndarray,
+    k: int = 6,
+    weight: str = "binary",   # "binary" | "distance" | "gaussian"
+    sigma: float = 1.0,
+) -> csr_matrix:
+    """
+    Build a sparse k-NN adjacency matrix from 2D spot coordinates.
+
+    Parameters
+    ----------
+    coords  : (N, 2) pixel coordinates
+    k       : number of nearest neighbours
+    weight  : edge weighting scheme
+                "binary"   → 1 for all edges
+                "distance" → 1 / (dist + 1e-8)
+                "gaussian" → exp(-dist² / (2σ²))
+    sigma   : bandwidth for gaussian weights (in same units as coords)
+
+    Returns
+    -------
+    A : (N, N) symmetric sparse adjacency matrix
+    """
+    N = coords.shape[0]
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(coords)
+    distances, indices = nbrs.kneighbors(coords)
+
+    rows, cols, vals = [], [], []
+    for i in range(N):
+        for j_pos in range(1, k + 1):          # skip self (index 0)
+            j   = indices[i, j_pos]
+            d   = distances[i, j_pos]
+
+            if weight == "binary":
+                w = 1.0
+            elif weight == "distance":
+                w = 1.0 / (d + 1e-8)
+            else:                               # gaussian
+                w = float(np.exp(-(d ** 2) / (2 * sigma ** 2 + 1e-10)))
+
+            rows.append(i)
+            cols.append(j)
+            vals.append(w)
+            rows.append(j)
+            cols.append(i)
+            vals.append(w)   
+
+    A = csr_matrix((vals, (rows, cols)), shape=(N, N))
+    return A
+
+
+def graph_laplacian(A: csr_matrix) -> csr_matrix:
+    """
+    Unnormalized graph Laplacian  L = D - A
+    where D is the diagonal degree matrix.
+    """
+    degree = np.asarray(A.sum(axis=1)).ravel()
+    D = diags(degree)
+    return D - A
+
+
+def niche_difficulty_from_data(
+    expression: np.ndarray,
+    coords: np.ndarray,
+    alpha: float = 0.40,
+    beta: float = 0.30,
+    gamma: float = 0.15,
+    delta: float = 0.15,
+    method: str = "spatial_leiden",
+    resolution: float = 1.0,
+    n_niches: Optional[int] = None,
+    spatial_weight: float = 0.3,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One-call convenience: build niches and compute niche-level difficulty.
+
+    Parameters
+    ----------
+    expression  : (N, G) log-normalised gene expression.
+    coords      : (N, 2) spatial coordinates.
+    alpha–delta : niche difficulty component weights (see
+                  ``compute_niche_difficulty``).
+    method      : niche construction method.
+    resolution  : Leiden resolution.
+    n_niches    : fixed niche count (only for k-means).
+    spatial_weight : spatial vs expression weight in joint feature space.
+
+    Returns
+    -------
+    niche_labels  : (N,) int — which niche each spot belongs to.
+    niche_scores  : (K,) float — difficulty of each niche.
+    spot_scores   : (N,) float — difficulty of each spot (mapped from niche).
+    """
+    from .niche import build_spatial_niches, compute_niche_difficulty
+
+    niche_labels = build_spatial_niches(
+        expression=expression,
+        coords=coords,
+        method=method,
+        resolution=resolution,
+        n_niches=n_niches,
+        spatial_weight=spatial_weight,
+    )
+
+    niche_scores, spot_scores = compute_niche_difficulty(
+        expression=expression,
+        coords=coords,
+        niche_labels=niche_labels,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        delta=delta,
+    )
+
+    return niche_labels, niche_scores, spot_scores
+
 
 def build_spatial_niches(
     expression: np.ndarray,
@@ -196,10 +320,10 @@ def niche_topology_difficulty(
     centroids = np.zeros((K, 2), dtype=np.float64)
     niche_expr = np.zeros((K, expression.shape[1]), dtype=np.float64)
 
-    for k in range(K):
-        mask = niche_labels == k
-        centroids[k] = coords[mask].mean(axis=0)
-        niche_expr[k] = expression[mask].mean(axis=0)
+    for niche_idx in range(K):
+        mask = niche_labels == niche_idx
+        centroids[niche_idx] = coords[mask].mean(axis=0)
+        niche_expr[niche_idx] = expression[mask].mean(axis=0)
 
     # Graph on niche centroids
     A = build_spatial_adjacency(centroids, k=min(k, K - 1), weight="binary")
@@ -341,38 +465,8 @@ def plot_niche_quality(
     figsize: Tuple[float, float] = (18, 12),
     cmap: str = "plasma",
     title: str = "Niche Quality Dashboard",
-) -> "matplotlib.figure.Figure":
-    """Multi-panel dashboard visualising niche quality.
-
-    Panels
-    ------
-    1. **Spatial map** — spots coloured by niche label (discrete).
-    2. **Difficulty heatmap** — spots coloured by per-spot difficulty.
-    3. **Niche composition** — bar chart of niche sizes.
-    4. **Difficulty components** — per-niche heterogeneity, topology, ambiguity.
-    5. **Spatial coherence** — histogram of neighbour-agreement per spot.
-    6. **Silhouette summary** — per-niche silhouette scores.
-
-    Parameters
-    ----------
-    expression  : (N, G) log-normalised expression.
-    coords      : (N, 2) spatial coordinates.
-    niche_labels : (N,) niche assignment per spot.
-    niche_scores : (K,) composite difficulty per niche (0–1).
-    spot_scores  : (N,) difficulty propagated to each spot.
-    save_path   : optional path to save figure.
-    show        : whether to call ``plt.show()``.
-    figsize     : figure dimensions.
-    cmap        : colour map for continuous values.
-    title       : figure suptitle.
-
-    Returns
-    -------
-    fig : matplotlib Figure.
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import Normalize
-    from matplotlib.cm import ScalarMappable
+):
+   
 
     K = int(niche_labels.max()) + 1
     counts = np.bincount(niche_labels, minlength=K)
@@ -395,12 +489,12 @@ def plot_niche_quality(
         s=8, alpha=0.7, edgecolors="none"
     )
     ax.set_title(f"Spatial Niche Map (K={K})")
-    ax.set_xlabel("x"); ax.set_ylabel("y")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
     ax.set_aspect("equal")
     cbar = fig.colorbar(scatter, ax=ax, ticks=range(K), shrink=0.7)
     cbar.set_label("Niche label")
 
-    # ---- 2. Difficulty heatmap ----
     ax = axes[0, 1]
     norm = Normalize(vmin=spot_scores.min(), vmax=spot_scores.max())
     sc = ax.scatter(
@@ -408,7 +502,8 @@ def plot_niche_quality(
         s=8, alpha=0.7, edgecolors="none", norm=norm,
     )
     ax.set_title("Per-Spot Difficulty")
-    ax.set_xlabel("x"); ax.set_ylabel("y")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
     ax.set_aspect("equal")
     fig.colorbar(sc, ax=ax, shrink=0.7, label="Difficulty")
 
@@ -497,10 +592,9 @@ def plot_niche_spatial(
     save_path: Optional[str] = None,
     show: bool = True,
     title: str = "Niche Spatial View",
-) -> "matplotlib.figure.Figure":
-    """Side-by-side spatial views: discrete niches vs continuous difficulty."""
-    import matplotlib.pyplot as plt
+):
 
+    
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
     fig.suptitle(title, fontsize=13, fontweight="bold")
 
@@ -512,7 +606,8 @@ def plot_niche_spatial(
         cmap="tab20", s=10, alpha=0.7, edgecolors="none",
     )
     ax1.set_title(f"Niche Labels (K={K})")
-    ax1.set_xlabel("x"); ax1.set_ylabel("y")
+    ax1.set_xlabel("x")
+    ax1.set_ylabel("y")
     ax1.set_aspect("equal")
     cbar1 = fig.colorbar(sc1, ax=ax1, ticks=range(K), shrink=0.7)
     cbar1.set_label("Niche")
@@ -531,7 +626,8 @@ def plot_niche_spatial(
             s=10, alpha=0.5, edgecolors="none",
         )
         ax2.set_title("Spatial Layout")
-    ax2.set_xlabel("x"); ax2.set_ylabel("y")
+    ax2.set_xlabel("x")
+    ax2.set_ylabel("y")
     ax2.set_aspect("equal")
 
     plt.tight_layout()
@@ -555,9 +651,7 @@ def plot_niche_difficulty_components(
     save_path: Optional[str] = None,
     show: bool = True,
     title: str = "Niche Difficulty Breakdown",
-) -> "matplotlib.figure.Figure":
-    """Bar chart breaking composite difficulty into its components."""
-    import matplotlib.pyplot as plt
+):
 
     K = len(niche_scores)
     x = np.arange(K)
@@ -626,7 +720,7 @@ def _spatial_coherence_per_spot(
     coords: np.ndarray,
     k: int = 6,
 ) -> np.ndarray:
-    """Fraction of k nearest neighbours sharing the same niche (per spot)."""
+
     from sklearn.neighbors import NearestNeighbors
 
     N = len(niche_labels)

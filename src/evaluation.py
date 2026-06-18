@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 from scipy.stats import pearsonr, spearmanr
 import matplotlib.pyplot as plt
-from src.difficulty_gse import SpatialDynamicsField, niche_difficulty_from_data, graph_signal_energy_difficulty
+from src.niche import SpatialDynamicsField, niche_difficulty_from_data
 from src.curriculum import TrainingLog
 from src.utils import move_to_device, flatten_indices
 from src.niche import niche_heterogeneity, niche_topology_difficulty, niche_ambiguity, build_spatial_niches
@@ -157,9 +157,6 @@ def build_difficulty_field(
     gamma: float = 0.15,   # ambiguity
     delta: float = 0.15,   # uncertainty (ignored here — no training dynamics)
     # --- GSE blend ---
-    use_gse: bool = False,
-    gse_alpha: float = 0.5,
-    k_neighbours: int = 6,
     random_state: int = 42,
 ) -> SpatialDynamicsField:
     """
@@ -219,21 +216,8 @@ def build_difficulty_field(
           f"spot_scores: min={spot_scores.min():.4f} max={spot_scores.max():.4f} "
           f"mean={spot_scores.mean():.4f}")
 
-    # Step 4: optionally blend with GSE for sharper boundary signal
-    if use_gse:
-        from src.difficulty_gse import graph_signal_energy_difficulty
-        gse_scores = graph_signal_energy_difficulty(
-            base_score=spot_scores,
-            coords=coords,
-            k=k_neighbours,
-            alpha=gse_alpha,
-            weight="binary",
-        )
-        final_scores = gse_scores
-        print(f"[DifficultyField] GSE blend applied: alpha={gse_alpha} | "
-              f"final: min={final_scores.min():.4f} max={final_scores.max():.4f}")
-    else:
-        final_scores = spot_scores
+    
+    final_scores = spot_scores
         
     save_path="difficulty_map.png"
     title="Spatial Difficulty Map"

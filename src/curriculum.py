@@ -8,7 +8,6 @@ from typing import Optional, List, Callable, Tuple
 
 from src.utils import (
     move_to_device,
-    flatten_indices,
     select_active_inputs,
     select_active_targets,
 )
@@ -63,7 +62,7 @@ class ThresholdScheduler:
                             train_loss: float, val_loss: float,
                             val_pcc: float, tau: float,
                             niche_stats: dict) -> None:
-        """Print a detailed epoch summary including niche expansion info."""
+
         parts = [
             f"Epoch {epoch + 1:3d}/{total_epochs} | "
             f"train={train_loss:.4f} | val={val_loss:.4f} | "
@@ -103,10 +102,7 @@ def evaluate(
     loss_fn: Callable,
     device: torch.device,
 ) -> Tuple[float, float]:
-    """
-    Evaluate model on loader and return both validation loss and spot-wise PCC.
-    PCC is averaged across spots (each spot is a gene expression vector).
-    """
+    
     model.eval()
     total_loss, total_n = 0.0, 0
     all_pred, all_target = [], []
@@ -281,7 +277,6 @@ def train_curriculum(
     best_val = float("inf")
     best_state: Optional[dict] = None
 
-    # Summarise niche layout
     n_niche_slides = sum(1 for v in difficulty_repo.values()
                          if isinstance(v, dict) and "niche" in v)
     if n_niche_slides > 0:
@@ -324,7 +319,7 @@ def train_curriculum(
     # restore best weights
     if best_state is not None:
         model.load_state_dict(best_state)
-        print(f"[Phase 4] Restored best val checkpoint (val={best_val:.4f}).")
+        print(f"Restored best val checkpoint (val={best_val:.4f}).")
 
-    print("[Phase 4] Training complete.")
+    print("Training complete.")
     return model, log

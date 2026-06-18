@@ -4,7 +4,7 @@ dataset:
   data_root: null
   fold: 9
   train_slide_index: 0
-  test_slide_index: 2
+  test_slide_index: 0
   flatten: false
 
 training:
@@ -24,10 +24,7 @@ model:
   kwargs: {}
 
 
-# ---------------------------------------------------------------------------
-# Niche / Microenvironment configuration
-# Set enabled: false to fall back to spot-level difficulty (original).
-# ---------------------------------------------------------------------------
+
 niche:
 
   enabled: true                # true → niche-level difficulty; false → spot-level

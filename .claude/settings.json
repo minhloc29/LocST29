@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -m scripts.niche_quality_analysis --n_spots 1500 --n_genes 100 --K 5 8 12 16 20 30)"
+      "Bash(python3 -m scripts.niche_quality_analysis --n_spots 1500 --n_genes 100 --K 5 8 12 16 20 30)",
+      "Bash(conda run *)",
+      "Bash(conda info *)"
     ]
   }
 }

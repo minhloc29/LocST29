@@ -1,16 +1,5 @@
-"""
-Analyse niche quality from a curriculum checkpoint.
-
-Usage:
-    python -m scripts.niche_quality_analysis --checkpoint <path> [--n_niches 12]
-"""
 
 from __future__ import annotations
-
-import argparse
-import sys
-from pathlib import Path
-from src.difficulty_gse import *
 from src.niche import *
 from src.dataset import *
 
@@ -52,8 +41,6 @@ def main():
     
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    print(f"Check ckpt: {ckpt}")
-
 
     if hasattr(expr, "numpy"):
         expr = expr.numpy()
@@ -68,7 +55,6 @@ def main():
     niche_scores, spot_scores = compute_niche_difficulty(expr, coords, labels)
     summarise_niches(labels, niche_scores)
 
-    # Dashboard
     plot_niche_quality(
         expr, coords, labels, niche_scores, spot_scores,
         save_path=output, show=False,

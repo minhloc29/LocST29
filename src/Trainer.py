@@ -17,8 +17,6 @@ from src.curriculum import (
 
 def build_difficulty_repo(
     train_base,
-    k_neighbours: int = 6,
-    use_niches: bool = True,
     niche_cfg: Optional = None,
 ) -> dict:
     """
@@ -45,49 +43,37 @@ def build_difficulty_repo(
 
     repo = {}
 
-    mode = "niche" if use_niches else "spot"
     print(f"[DifficultyRepo] Computing per-slide difficulty from expression "
-          f"({len(train_base)} slides, mode={mode})...")
+          f"({len(train_base)} slides, mode=niche)...")
 
     for slide_idx in range(len(train_base)):
         slide_name = train_base.names[slide_idx]
         expression = train_base.exp_dict[slide_name]          # (N_spots, G)
         coords = train_base.center_dict[slide_name].astype(float)  # (N_spots, 2)
 
-        if use_niches:
-            # --- Niche-level difficulty ---
-            kws = vars(niche_cfg) if niche_cfg is not None else {}
-            niche_labels, niche_scores, spot_scores = niche_difficulty_from_data(
-                expression=expression,
-                coords=coords,
-                alpha=kws.get("alpha", 0.40),
-                beta=kws.get("beta", 0.30),
-                gamma=kws.get("gamma", 0.15),
-                delta=kws.get("delta", 0.15),
-                method=kws.get("method", "spatial_leiden"),
-                resolution=kws.get("resolution", 1.0),
-                n_niches=kws.get("n_niches", None),
-                spatial_weight=kws.get("spatial_weight", 0.3),
-            )
-            repo[slide_idx] = {
-                "spot": spot_scores,
-                "niche": niche_scores,
-                "niche_labels": niche_labels,
-            }
-            print(f"  Slide {slide_name:>4} | N={len(spot_scores):>3} "
-                  f"K={len(niche_scores):>2} | "
-                  f"niche_mean={niche_scores.mean():.3f} | "
-                  f"spot_mean={spot_scores.mean():.3f}")
-        else:
-            # --- Spot-level difficulty (original) ---
-            scores = topological_difficulty_from_data(
-                expression=expression,
-                coords=coords,
-                k_neighbours=k_neighbours,
-            )
-            repo[slide_idx] = scores
-            print(f"  Slide {slide_name:>4} | N={len(scores):>3} | "
-                  f"mean_score={scores.mean():.3f} | std={scores.std():.3f}")
+        kws = vars(niche_cfg) if niche_cfg is not None else {}
+        niche_labels, niche_scores, spot_scores = niche_difficulty_from_data(
+            expression=expression,
+            coords=coords,
+            alpha=kws.get("alpha", 0.40),
+            beta=kws.get("beta", 0.30),
+            gamma=kws.get("gamma", 0.15),
+            delta=kws.get("delta", 0.15),
+            method=kws.get("method", "spatial_leiden"),
+            resolution=kws.get("resolution", 1.0),
+            n_niches=kws.get("n_niches", None),
+            spatial_weight=kws.get("spatial_weight", 0.3),
+        )
+        repo[slide_idx] = {
+            "spot": spot_scores,
+            "niche": niche_scores,
+            "niche_labels": niche_labels,
+        }
+        print(f"  Slide {slide_name:>4} | N={len(spot_scores):>3} "
+                f"K={len(niche_scores):>2} | "
+                f"niche_mean={niche_scores.mean():.3f} | "
+                f"spot_mean={spot_scores.mean():.3f}")
+        
 
     return repo
 
@@ -214,11 +200,7 @@ class SpatialCurriculumTrainer:
         train_loader,
         val_loader,
     ) -> dict:
-        """
-        Run full curriculum training.
-
-        Returns a dict with trained models, training log, and difficulty repo.
-        """
+       
         self.model = model
         self.baseline_model = baseline_model
         self.optimizer = optimizer
@@ -236,14 +218,12 @@ class SpatialCurriculumTrainer:
         print(f"  slides: {len(train_base)} | spots: {self.p1.coords.shape[0]}"
               f" | mode={'niche' if use_niches else 'spot'}")
 
-        # ── Step 1: build niche difficulty for all training slides ──
+
         self.difficulty_repo = build_difficulty_repo(
             train_base,
-            k_neighbours=self.cfg.difficulty.k_neighbours,
-            use_niches=use_niches,
-            niche_cfg=self.cfg.niche if use_niches else None,
+            niche_cfg=self.cfg.niche
         )
-        # ── Step 3: curriculum training ──
+        
         self.model, self._training_log = train_curriculum(
             self.model, self.optimizer, loss_fn,
             train_loader, val_loader, self.difficulty_repo,
@@ -253,7 +233,7 @@ class SpatialCurriculumTrainer:
             init_checkpoint=self.cfg.checkpoint.init_checkpoint,
         )
 
-        # ── Step 2: baseline (full-data, no curriculum) ──
+
         self.baseline_model, self._baseline_log = self.train_baseline(
             baseline_model, baseline_optimizer, loss_fn, train_loader, val_loader,
         )
