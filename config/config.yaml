@@ -2,7 +2,7 @@ dataset:
 
   name: her2st
   data_root: null
-  fold: 6
+  fold: 8
   train_slide_index: 0
   test_slide_index: 0
   flatten: false
@@ -13,7 +13,7 @@ training:
   batch_size: 1
   num_workers: 0
   lr: 0.00001
-  seed: 42
+  seed: 40
   device: cuda
   max_grad_norm: 1.0
 
@@ -34,10 +34,7 @@ niche:
 
   # Niche difficulty component weights (must sum to 1.0 for the formula below)
   # D_niche = alpha * heterogeneity + beta * topology + gamma * ambiguity
-  alpha: 0.5
-  beta: 0.5
-  gamma: 0.5
-  delta: 0.0                # reserved for training-dynamics uncertainty
+          # reserved for training-dynamics uncertainty
 
 
 difficulty:

@@ -10,35 +10,26 @@ from sklearn.decomposition import PCA
 from scipy.sparse import csr_matrix, diags
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
-from scipy.stats import rankdata
+from sklearn.metrics import silhouette_samples
+from sklearn.preprocessing import StandardScaler
 
 @dataclass
 class SpatialDynamicsField:
 
-    coords: np.ndarray            # (N, 2) spatial coordinates
-    difficulty_score: np.ndarray  # (N,) higher = harder
+    coords: np.ndarray          
+    difficulty_score: np.ndarray  
 
     @property
     def N(self) -> int:
         return len(self.difficulty_score)
 
-
-def _rank_norm(x):
-    
-    r = rankdata(x, method="average")
-    return ((r - 1) / max(len(r) - 1, 1)).astype(np.float32)
-
-def _norm(x):
-        lo, hi = x.min(), x.max()
-        return np.zeros_like(x, dtype=np.float32) if hi - lo < 1e-10 else ((x - lo) / (hi - lo)).astype(np.float32)
-    
 def build_spatial_adjacency(
     coords: np.ndarray,
     k: int = 6,
-    weight: str = "binary",   # "binary" | "distance" | "gaussian"
+    weight: str = "binary",   
     sigma: float = 1.0,
 ) -> csr_matrix:
-    
+   
     N = coords.shape[0]
     nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(coords)
     distances, indices = nbrs.kneighbors(coords)
@@ -68,10 +59,7 @@ def build_spatial_adjacency(
 
 
 def graph_laplacian(A: csr_matrix) -> csr_matrix:
-    """
-    Unnormalized graph Laplacian  L = D - A
-    where D is the diagonal degree matrix.
-    """
+   
     degree = np.asarray(A.sum(axis=1)).ravel()
     D = diags(degree)
     return D - A
@@ -88,6 +76,8 @@ def niche_difficulty_from_data(
     resolution: float = 1.0,
     n_niches: Optional[int] = None,
     spatial_weight: float = 0.3,
+    aggregation: str = "correlation_weighted",
+    per_spot_error: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """One-call convenience: build niches and compute niche-level difficulty.
 
@@ -95,12 +85,16 @@ def niche_difficulty_from_data(
     ----------
     expression  : (N, G) log-normalised gene expression.
     coords      : (N, 2) spatial coordinates.
-    alpha–delta : niche difficulty component weights (see
-                  ``compute_niche_difficulty``).
+    alpha–delta : niche difficulty component weights (only used when
+                  ``aggregation="linear"``).
     method      : niche construction method.
     resolution  : Leiden resolution.
     n_niches    : fixed niche count (only for k-means).
     spatial_weight : spatial vs expression weight in joint feature space.
+    aggregation : aggregation strategy for combining difficulty components
+                  (passed to ``compute_niche_difficulty``).
+    per_spot_error : (N,) optional — per-spot prediction error for
+                     correlation-weighted aggregation.
 
     Returns
     -------
@@ -127,6 +121,8 @@ def niche_difficulty_from_data(
         beta=beta,
         gamma=gamma,
         delta=delta,
+        aggregation=aggregation,
+        per_spot_error=per_spot_error,
     )
 
     return niche_labels, niche_scores, spot_scores
@@ -227,33 +223,6 @@ def _niches_via_leiden(
     return labels.astype(np.int32)
 
 
-def build_expression_niches(
-    expression: np.ndarray,
-    coords: np.ndarray,
-    method: str = "spatial_leiden",
-    resolution: float = 1.0,
-    n_niches: Optional[int] = None,
-    spatial_weight: float = 0.3,
-    n_neighbors: int = 10,
-    random_state: int = 42,
-) -> np.ndarray:
-    """Alias for ``build_spatial_niches``."""
-    return build_spatial_niches(
-        expression=expression,
-        coords=coords,
-        method=method,
-        resolution=resolution,
-        n_niches=n_niches,
-        spatial_weight=spatial_weight,
-        n_neighbors=n_neighbors,
-        random_state=random_state,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Niche-level difficulty metrics
-# ---------------------------------------------------------------------------
-
 def niche_heterogeneity(
     expression: np.ndarray,
     niche_labels: np.ndarray,
@@ -275,7 +244,6 @@ def niche_heterogeneity(
         niche_expr = expression[mask]
         n = len(niche_expr)
         if n > 1:
-            # Mean pairwise cosine distance within the niche
             dists = cosine_distances(niche_expr)
             het[k] = float(dists[np.triu_indices_from(dists, k=1)].mean())
         else:
@@ -324,7 +292,16 @@ def niche_ambiguity(
     expression: np.ndarray,
     niche_labels: np.ndarray,
 ) -> np.ndarray:
-    
+    """Per-spot ambiguity of niche membership.
+
+    A spot is *ambiguous* when it is nearly as close to a different niche's
+    centroid as it is to its own — i.e. it sits near a niche boundary in
+    expression space.
+
+    Returns
+    -------
+    ambiguity : (N,) array, higher = more ambiguous (harder).
+    """
     K = int(niche_labels.max()) + 1
     centroids = np.zeros((K, expression.shape[1]), dtype=np.float64)
 
@@ -358,44 +335,219 @@ def niche_ambiguity(
 
 
 # ---------------------------------------------------------------------------
-# Composite niche difficulty
+# Rank-aggregation helpers
 # ---------------------------------------------------------------------------
+
+def _rank(x: np.ndarray) -> np.ndarray:
+    """Convert values to ranks in [0, 1].  Lower rank = lower original value."""
+    from scipy.stats import rankdata
+    ranks = rankdata(x, method="average")  # 1-based
+    return (ranks - 1.0) / (len(ranks) - 1.0) if len(ranks) > 1 else np.zeros_like(ranks)
+
+
+def _normalise(x: np.ndarray) -> np.ndarray:
+    """Min-max normalise to [0, 1]."""
+    lo, hi = x.min(), x.max()
+    return np.zeros_like(x, dtype=np.float32) if hi - lo < 1e-10 else ((x - lo) / (hi - lo)).astype(np.float32)
+
+
+def rank_aggregate_correlation_weighted(
+    het: np.ndarray,
+    topo: np.ndarray,
+    amb_per_spot: np.ndarray,
+    niche_labels: np.ndarray,
+    per_spot_error: Optional[np.ndarray] = None,
+    *,
+    flip_negative_topo: bool = True,
+    epsilon: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Correlation-weighted rank aggregation (Strategy 1).
+
+    Weights each component by its Spearman correlation with the prediction
+    error target (or by a prior weight if *per_spot_error* is not provided).
+    If *flip_negative_topo* is True and the topology correlation is negative,
+    its rank axis is reversed so that high boundary-energy → high difficulty.
+
+    Parameters
+    ----------
+    het            : (K,)  niche heterogeneity
+    topo           : (K,)  niche topology (boundary energy)
+    amb_per_spot   : (N,)  per-spot ambiguity
+    niche_labels   : (N,)  niche assignment
+    per_spot_error : (N,)  optional — per-spot prediction error (MSE).
+                     If provided, correlations are computed against this.
+    flip_negative_topo : if True, flip topology ranks when r_topo < 0.
+    epsilon        : minimum weight floor to keep all components alive.
+
+    Returns
+    -------
+    niche_scores : (K,)  difficulty score per niche
+    spot_scores  : (N,)  difficulty score per spot
+    """
+    from scipy.stats import spearmanr
+
+    K = int(niche_labels.max()) + 1
+    N = len(niche_labels)
+
+    amb_niche = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
+
+    if per_spot_error is not None and per_spot_error.std() > 1e-10:
+        # Compute correlations at the per-spot level
+        spot_het = np.array([het[lbl] for lbl in niche_labels])
+        spot_topo = np.array([topo[lbl] for lbl in niche_labels])
+
+        r_het, _ = spearmanr(spot_het, per_spot_error)
+        r_topo, _ = spearmanr(spot_topo, per_spot_error)
+        r_amb, _ = spearmanr(amb_per_spot, per_spot_error)
+
+        abs_sum = abs(r_het) + abs(r_topo) + abs(r_amb)
+        if abs_sum < 1e-10:
+            w_het = w_topo = w_amb = 1.0 / 3.0
+        else:
+            w_het = abs(r_het) / abs_sum
+            w_topo = abs(r_topo) / abs_sum
+            w_amb = abs(r_amb) / abs_sum
+
+        for w in [w_het, w_topo, w_amb]:
+            if w < epsilon:
+                w = epsilon
+        # Renormalise
+        w_sum = w_het + w_topo + w_amb
+        w_het /= w_sum
+        w_topo /= w_sum
+        w_amb /= w_sum
+
+        flip_topo = r_topo < 0 and flip_negative_topo
+    else:
+        w_het = w_topo = w_amb = 1.0 / 3.0
+        flip_topo = False
+
+    het_rank = _rank(het)
+    topo_rank = _rank(topo)
+    amb_rank = _rank(amb_niche)
+
+    if flip_topo:
+        topo_rank = 1.0 - topo_rank
+
+    niche_scores = (
+        w_het * het_rank + w_topo * topo_rank + w_amb * amb_rank
+    )
+    niche_scores = _normalise(niche_scores)
+
+    amb_n_spot = _normalise(amb_per_spot)
+    spot_scores = np.array([niche_scores[int(lbl)] for lbl in niche_labels], dtype=np.float32)
+    spot_scores = _normalise(spot_scores + 0.3 * amb_n_spot)
+
+    return niche_scores.astype(np.float32), spot_scores.astype(np.float32)
+
+
+def rank_aggregate_median(
+    het: np.ndarray,
+    topo: np.ndarray,
+    amb_per_spot: np.ndarray,
+    niche_labels: np.ndarray,
+    *,
+    flip_negative_topo: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Median rank aggregation (Strategy 3).
+
+    Less sensitive to one noisy component than mean aggregation.
+    Each component is normalised to [0, 1] then the median is taken.
+
+    Returns
+    -------
+    niche_scores : (K,)
+    spot_scores  : (N,)
+    """
+    K = int(niche_labels.max()) + 1
+    amb_niche = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
+
+    het_n = _normalise(het)
+    topo_n = _normalise(topo)
+    amb_n = _normalise(amb_niche)
+
+    if flip_negative_topo:
+        # If topology is anticorrelated with difficulty, flip it
+        # (user can control this — default False keeps it simple)
+        topo_n = 1.0 - topo_n
+
+    # Median across the 3 components at the niche level
+    stacked = np.column_stack([het_n, topo_n, amb_n])  # (K, 3)
+    niche_scores = np.median(stacked, axis=1)
+    niche_scores = _normalise(niche_scores)
+
+    # Per-spot: broadcast niche score + local ambiguity refinement
+    spot_scores = np.array([niche_scores[int(lbl)] for lbl in niche_labels], dtype=np.float32)
+    amb_n_spot = _normalise(amb_per_spot)
+    spot_scores = _normalise(spot_scores + 0.3 * amb_n_spot)
+
+    return niche_scores.astype(np.float32), spot_scores.astype(np.float32)
+
+
+def rank_aggregate_borda(
+    het: np.ndarray,
+    topo: np.ndarray,
+    amb_per_spot: np.ndarray,
+    niche_labels: np.ndarray,
+    *,
+    flip_negative_topo: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Borda rank aggregation (Strategy 2).
+
+    Simple average of the three component ranks — no weights, no training.
+    Surprisingly robust in ensemble settings.
+
+    Returns
+    -------
+    niche_scores : (K,)
+    spot_scores  : (N,)
+    """
+    K = int(niche_labels.max()) + 1
+    amb_niche = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
+
+    het_rank = _rank(het)
+    topo_rank = _rank(topo)
+    amb_rank = _rank(amb_niche)
+
+    if flip_negative_topo:
+        topo_rank = 1.0 - topo_rank
+
+    niche_scores = (het_rank + topo_rank + amb_rank) / 3.0
+    niche_scores = _normalise(niche_scores)
+
+    spot_scores = np.array([niche_scores[int(lbl)] for lbl in niche_labels], dtype=np.float32)
+    amb_n_spot = _normalise(amb_per_spot)
+    spot_scores = _normalise(spot_scores + 0.3 * amb_n_spot)
+
+    return niche_scores.astype(np.float32), spot_scores.astype(np.float32)
+
+
 
 def compute_niche_difficulty(
     expression, coords, niche_labels,
-    alpha=0.3, beta=0.0, gamma=0.7, delta=0.0,
-    niche_dynamics_uncertainty=None,
-    use_spot_level_ambiguity=True,   # NEW flag
+    aggregation: str = "correlation_weighted",
+    per_spot_error: Optional[np.ndarray] = None,
 ):
+   
     K = int(niche_labels.max()) + 1
     het = niche_heterogeneity(expression, niche_labels)
     topo = niche_topology_difficulty(niche_labels, coords, expression)
     amb_per_spot = niche_ambiguity(expression, niche_labels)
 
-    het_n = _rank_norm(het)
-    topo_n = _rank_norm(topo)
-
-    niche_scores = alpha * het_n + beta * topo_n
-    spot_scores = np.array([niche_scores[int(lbl)] for lbl in niche_labels], dtype=np.float32)
-
-    if use_spot_level_ambiguity:
-        amb_n_spot = _rank_norm(amb_per_spot)
-        spot_scores = spot_scores + gamma * amb_n_spot
-        amb_niche_mean = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
-        niche_scores = niche_scores + gamma * _rank_norm(amb_niche_mean)
-    else:
-        amb = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
-        amb_n = _rank_norm(amb)
-        niche_scores = niche_scores + gamma * amb_n
-        spot_scores = spot_scores + gamma * amb_n[niche_labels]
-
-    print(f"Check scores: {het_n, topo_n, amb_n_spot}")
-    return niche_scores, spot_scores
-
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+    if aggregation in ("correlation_weighted",):
+        return rank_aggregate_correlation_weighted(
+            het, topo, amb_per_spot, niche_labels,
+            per_spot_error=per_spot_error,
+        )
+    elif aggregation == "borda":
+        return rank_aggregate_borda(
+            het, topo, amb_per_spot, niche_labels,
+        )
+    elif aggregation == "median":
+        return rank_aggregate_median(
+            het, topo, amb_per_spot, niche_labels,
+        )
+        
 
 def summarise_niches(
     niche_labels: np.ndarray,
@@ -417,10 +569,6 @@ def summarise_niches(
           f"hard_frac={stats['frac_hard_niches']:.1%}")
     return stats
 
-
-# ---------------------------------------------------------------------------
-# Niche visualisation
-# ---------------------------------------------------------------------------
 
 def plot_niche_quality(
     expression: np.ndarray,
@@ -663,8 +811,6 @@ def _per_niche_silhouette(
     random_state = 42
 ) -> np.ndarray:
     """Mean silhouette per niche on joint [expression, space] features."""
-    from sklearn.metrics import silhouette_samples
-    from sklearn.preprocessing import StandardScaler
 
     K = int(niche_labels.max()) + 1
     if K < 2:
@@ -688,8 +834,6 @@ def _spatial_coherence_per_spot(
     coords: np.ndarray,
     k: int = 6,
 ) -> np.ndarray:
-
-    from sklearn.neighbors import NearestNeighbors
 
     N = len(niche_labels)
     nbrs = NearestNeighbors(n_neighbors=k + 1).fit(coords)
