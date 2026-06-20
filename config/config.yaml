@@ -31,10 +31,7 @@ niche:
   method: "spatial_leiden"     # "spatial_leiden" | "spatial_kmeans" | "louvain"
   resolution: 2.0            # Leiden resolution (larger → more niches)
   spatial_weight: 0.3   # weight for spatial coords in joint feature space
-
-  # Niche difficulty component weights (must sum to 1.0 for the formula below)
-  # D_niche = alpha * heterogeneity + beta * topology + gamma * ambiguity
-          # reserved for training-dynamics uncertainty
+  aggregation: "correlation_weighted"  # rank aggregation strategy: correlation_weighted | borda | median
 
 
 difficulty:

@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from typing import Optional, Tuple
 from dataclasses import dataclass
 import numpy as np
@@ -68,10 +67,6 @@ def graph_laplacian(A: csr_matrix) -> csr_matrix:
 def niche_difficulty_from_data(
     expression: np.ndarray,
     coords: np.ndarray,
-    alpha: float = 0.40,
-    beta: float = 0.30,
-    gamma: float = 0.15,
-    delta: float = 0.15,
     method: str = "spatial_leiden",
     resolution: float = 1.0,
     n_niches: Optional[int] = None,
@@ -102,7 +97,6 @@ def niche_difficulty_from_data(
     niche_scores  : (K,) float — difficulty of each niche.
     spot_scores   : (N,) float — difficulty of each spot (mapped from niche).
     """
-    from .niche import build_spatial_niches, compute_niche_difficulty
 
     niche_labels = build_spatial_niches(
         expression=expression,
@@ -117,10 +111,6 @@ def niche_difficulty_from_data(
         expression=expression,
         coords=coords,
         niche_labels=niche_labels,
-        alpha=alpha,
-        beta=beta,
-        gamma=gamma,
-        delta=delta,
         aggregation=aggregation,
         per_spot_error=per_spot_error,
     )
@@ -292,16 +282,7 @@ def niche_ambiguity(
     expression: np.ndarray,
     niche_labels: np.ndarray,
 ) -> np.ndarray:
-    """Per-spot ambiguity of niche membership.
-
-    A spot is *ambiguous* when it is nearly as close to a different niche's
-    centroid as it is to its own — i.e. it sits near a niche boundary in
-    expression space.
-
-    Returns
-    -------
-    ambiguity : (N,) array, higher = more ambiguous (harder).
-    """
+  
     K = int(niche_labels.max()) + 1
     centroids = np.zeros((K, expression.shape[1]), dtype=np.float64)
 
@@ -328,15 +309,9 @@ def niche_ambiguity(
         ).min()
         dist_to_nearest_other[i] = d_other
 
-    # Ambiguity: own-dist / nearest-other-dist
-    # High when the spot is as close to another niche as to its own
     ambiguity = dist_to_own / (dist_to_nearest_other + 1e-10)
     return ambiguity.astype(np.float32)
 
-
-# ---------------------------------------------------------------------------
-# Rank-aggregation helpers
-# ---------------------------------------------------------------------------
 
 def _rank(x: np.ndarray) -> np.ndarray:
     """Convert values to ranks in [0, 1].  Lower rank = lower original value."""
@@ -361,29 +336,7 @@ def rank_aggregate_correlation_weighted(
     flip_negative_topo: bool = True,
     epsilon: float = 0.05,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Correlation-weighted rank aggregation (Strategy 1).
-
-    Weights each component by its Spearman correlation with the prediction
-    error target (or by a prior weight if *per_spot_error* is not provided).
-    If *flip_negative_topo* is True and the topology correlation is negative,
-    its rank axis is reversed so that high boundary-energy → high difficulty.
-
-    Parameters
-    ----------
-    het            : (K,)  niche heterogeneity
-    topo           : (K,)  niche topology (boundary energy)
-    amb_per_spot   : (N,)  per-spot ambiguity
-    niche_labels   : (N,)  niche assignment
-    per_spot_error : (N,)  optional — per-spot prediction error (MSE).
-                     If provided, correlations are computed against this.
-    flip_negative_topo : if True, flip topology ranks when r_topo < 0.
-    epsilon        : minimum weight floor to keep all components alive.
-
-    Returns
-    -------
-    niche_scores : (K,)  difficulty score per niche
-    spot_scores  : (N,)  difficulty score per spot
-    """
+    
     from scipy.stats import spearmanr
 
     K = int(niche_labels.max()) + 1
@@ -411,7 +364,7 @@ def rank_aggregate_correlation_weighted(
         for w in [w_het, w_topo, w_amb]:
             if w < epsilon:
                 w = epsilon
-        # Renormalise
+
         w_sum = w_het + w_topo + w_amb
         w_het /= w_sum
         w_topo /= w_sum
@@ -449,16 +402,7 @@ def rank_aggregate_median(
     *,
     flip_negative_topo: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Median rank aggregation (Strategy 3).
-
-    Less sensitive to one noisy component than mean aggregation.
-    Each component is normalised to [0, 1] then the median is taken.
-
-    Returns
-    -------
-    niche_scores : (K,)
-    spot_scores  : (N,)
-    """
+    
     K = int(niche_labels.max()) + 1
     amb_niche = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
 
@@ -467,16 +411,12 @@ def rank_aggregate_median(
     amb_n = _normalise(amb_niche)
 
     if flip_negative_topo:
-        # If topology is anticorrelated with difficulty, flip it
-        # (user can control this — default False keeps it simple)
         topo_n = 1.0 - topo_n
 
-    # Median across the 3 components at the niche level
     stacked = np.column_stack([het_n, topo_n, amb_n])  # (K, 3)
     niche_scores = np.median(stacked, axis=1)
     niche_scores = _normalise(niche_scores)
 
-    # Per-spot: broadcast niche score + local ambiguity refinement
     spot_scores = np.array([niche_scores[int(lbl)] for lbl in niche_labels], dtype=np.float32)
     amb_n_spot = _normalise(amb_per_spot)
     spot_scores = _normalise(spot_scores + 0.3 * amb_n_spot)

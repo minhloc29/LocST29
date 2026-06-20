@@ -137,115 +137,57 @@ def compute_error_vector(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
 def build_difficulty_field(
     expression: np.ndarray,
     coords: np.ndarray,
-    # --- Niche construction ---
     method: str = "spatial_leiden",
     resolution: float = 1.0,
     n_niches: Optional[int] = None,
     spatial_weight: float = 0.3,
     n_neighbors: int = 10,
-    # --- Niche difficulty weights ---
-    alpha: float = 0.40,   # heterogeneity
-    beta: float = 0.30,    # topology / boundary energy
-    gamma: float = 0.15,   # ambiguity
-    delta: float = 0.15,   # uncertainty (ignored here — no training dynamics)
-    # --- GSE blend ---
+    aggregation: str = "correlation_weighted",
     random_state: int = 42,
-) -> SpatialDynamicsField:
-    """
-    Build a DifficultyField from raw expression and coordinates.
-
-    Pipeline
-    --------
-    1. Build spatial niches (Leiden / Louvain / K-means on joint features)
-    2. Compute per-niche difficulty (heterogeneity + topology + ambiguity)
-    3. Propagate niche scores to spots
-    4. Optionally blend with Graph Signal Energy (GSE) for boundary sharpness
-    5. Return DifficultyField with difficulty_score (N,) and coords (N, 2)
-
-    Parameters
-    ----------
-    expression    : (N, G) log-normalized gene expression
-    coords        : (N, 2) pixel / spatial coordinates
-    method        : niche construction method
-    resolution    : Leiden resolution (larger → more niches)
-    n_niches      : fixed K for K-means; ignored for Leiden/Louvain
-    spatial_weight: weight of coords vs expression in joint clustering space
-    n_neighbors   : k-NN neighbors for graph construction in Leiden
-    alpha         : weight for niche heterogeneity
-    beta          : weight for niche topology (Laplacian boundary energy)
-    gamma         : weight for niche ambiguity
-    delta         : weight for training-dynamics uncertainty (set to 0 here)
-    use_gse       : if True, blend spot_scores with graph signal energy
-    gse_alpha     : blend weight (gse_alpha * niche_score + (1-gse_alpha) * boundary_energy)
-    k_neighbours  : spatial graph k for GSE boundary computation
-    random_state  : random seed for clustering
-
-    Returns
-    -------
-    DifficultyField with .difficulty_score (N,), .coords (N, 2), .N
-    """
+) -> Tuple[SpatialDynamicsField, np.ndarray]:
+   
     expression = np.nan_to_num(np.asarray(expression, dtype=np.float32), nan=0.0)
     coords = np.asarray(coords, dtype=np.float64)
 
     print(f"[DifficultyField] Building niches: N={len(expression)}, G={expression.shape[1]}, "
           f"method={method}, resolution={resolution}")
 
-    # Step 1 + 2 + 3: niches → per-niche scores → spot scores
     niche_labels, niche_scores, spot_scores = niche_difficulty_from_data(
         expression=expression,
         coords=coords,
-        alpha=alpha,
-        beta=beta,
-        gamma=gamma,
-        delta=0.0,          # no training dynamics available here
         method=method,
         resolution=resolution,
         n_niches=n_niches,
         spatial_weight=spatial_weight,
+        aggregation=aggregation,
     )
 
     print(f"[DifficultyField] Niches built: K={len(niche_scores)} | "
           f"spot_scores: min={spot_scores.min():.4f} max={spot_scores.max():.4f} "
           f"mean={spot_scores.mean():.4f}")
 
-    
     final_scores = spot_scores
-        
-    save_path="difficulty_map.png"
-    title="Spatial Difficulty Map"
+
+    save_path = "difficulty_map.png"
+    title = "Spatial Difficulty Map"
 
     plt.figure(figsize=(6, 6))
-
     plt.scatter(
-        coords[:, 0],
-        coords[:, 1],
+        coords[:, 0], coords[:, 1],
         c=final_scores.astype(np.float32),
-        cmap="hot",
-        s=25,
-        edgecolors="none"
+        cmap="hot", s=25, edgecolors="none",
     )
-
     plt.colorbar(label="Difficulty Score")
-
     plt.title(title)
     plt.xlabel("X")
     plt.ylabel("Y")
-
-    # ST coordinates usually come from image space
     plt.gca().invert_yaxis()
-
     plt.tight_layout()
-
-    plt.savefig(
-        save_path,
-        dpi=300,
-        bbox_inches="tight"
-    )
-
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
 
     print(f"[Saved] Difficulty map -> {save_path}")
-    
+
     return SpatialDynamicsField(
         difficulty_score=final_scores.astype(np.float32),
         coords=coords.astype(np.float32),
@@ -1143,50 +1085,50 @@ def run_evaluation(
 
 
 if __name__ == "__main__":
-    """CLI: evaluate trained curriculum & baseline models on test data.
+    """CLI: cross-fold evaluation of trained curriculum & baseline models.
 
     Usage
     -----
     python -m src.evaluation \\
         --checkpoint_dir ./outputs/run1 \\
-        --config ./configs/my_config.yaml
+        --config ./config.yaml \\
+        --folds 0 1 2 3 4 5 6 7 8 \\
+        --output_json ./results/cross_fold_report.json
 
-    This loads the curriculum model and baseline model from the checkpoint
-    directory, runs inference on the test set, computes all evaluation
-    metrics (MSE, PCC, MAE, difficulty bins, paper RQ1-RQ4 metrics), and
-    prints a summary.
+    Runs evaluation on each specified fold (test slide held out by that fold),
+    then aggregates results into a unified report with per-fold and mean metrics.
     """
     import argparse
     import json
     from pathlib import Path
     from importlib import import_module
+    from copy import deepcopy
 
     from torch.utils.data import DataLoader
 
     from src import (
         DataConfig,
         SpatialModelAdapter,
-        MultiSlideAdapter,
         build_slide_loader,
         load_dataset,
-        prepare_phase1,
     )
     from config.my_config import load_config
 
-    parser = argparse.ArgumentParser(description="Evaluate trained curriculum models")
+    parser = argparse.ArgumentParser(description="Cross-fold evaluation of trained curriculum models")
     parser.add_argument("--checkpoint_dir", type=str, required=True,
-                        help="Directory containing curriculum_model.pt and baseline_model.pt")
+                        help="Base directory containing fold subdirectories with model checkpoints")
     parser.add_argument("--config", type=str, required=True,
                         help="Path to training config YAML")
+    parser.add_argument("--folds", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                        help="Fold indices to evaluate (default: 0-8)")
     parser.add_argument("--output_json", type=str, default=None,
-                        help="Optional path to save results as JSON")
+                        help="Path to save unified cross-fold report as JSON")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     device = torch.device(cfg.training.device)
-    ckpt_dir = Path(args.checkpoint_dir)
+    base_ckpt_dir = Path(args.checkpoint_dir)
 
-    # ── Build model ──
     def _build_model(module_path, class_name, kwargs=None):
         if kwargs is None:
             kwargs = {}
@@ -1195,86 +1137,217 @@ if __name__ == "__main__":
         cls = getattr(import_module(module_path), class_name)
         return cls(**kwargs)
 
-    model = _build_model(cfg.model.module, cfg.model.class_name, cfg.model.kwargs)
-    baseline_model = _build_model(cfg.model.module, cfg.model.class_name, cfg.model.kwargs)
-    if cfg.pipeline.wrap_model:
-        model = SpatialModelAdapter(model)
-        baseline_model = SpatialModelAdapter(baseline_model)
+    def _convert_for_json(obj):
+        """Recursively convert dataclass / numpy types to plain JSON-safe types."""
+        from dataclasses import asdict, is_dataclass
+        if is_dataclass(obj):
+            return _convert_for_json(asdict(obj))
+        if isinstance(obj, dict):
+            return {k: _convert_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_convert_for_json(v) for v in obj]
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return obj
 
-    # ── Load checkpoints ──
-    ckpt_path = ckpt_dir / "curriculum_model.pt"
-    base_ckpt_path = ckpt_dir / "baseline_model.pt"
-    if ckpt_path.exists():
-        model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
-        print(f"[Eval] Loaded curriculum model from {ckpt_path}")
-    else:
-        print(f"[Eval] WARNING: {ckpt_path} not found — using random weights")
-    if base_ckpt_path.exists():
-        baseline_model.load_state_dict(torch.load(base_ckpt_path, map_location="cpu"))
-        print(f"[Eval] Loaded baseline model from {base_ckpt_path}")
-    else:
-        print(f"[Eval] WARNING: {base_ckpt_path} not found — using random weights")
+    # ── Track per-fold results ──
+    per_fold_reports: Dict[int, dict] = {}
 
-    model.to(device)
-    baseline_model.to(device)
+    for fold in args.folds:
+        print(f"\n{'='*60}")
+        print(f"  FOLD {fold}")
+        print(f"{'='*60}")
 
-    # ── Build dataset & loader ──
-    data_root = Path(cfg.dataset.data_root).resolve() if cfg.dataset.data_root else None
-    data_cfg = DataConfig(
-        dataset=cfg.dataset.name, fold=cfg.dataset.fold,
-        adj=True, flatten=cfg.dataset.flatten, data_root=data_root,
-    )
-    test_base = load_dataset(data_cfg, train=False)
-    if len(test_base.names) == 0:
-        test_base = load_dataset(data_cfg, train=True)
-        print("[Eval] No test set — using training set for evaluation")
-    test_loader = build_slide_loader(
-        test_base, slide_index=cfg.dataset.test_slide_index,
-        batch_size=cfg.training.batch_size, num_workers=cfg.training.num_workers,
-    )
-
-    # ── Get data for field construction ──
-    slide_name = test_base.names[cfg.dataset.test_slide_index]
-    expression = test_base.exp_dict[slide_name]
-    coords = test_base.center_dict[slide_name].astype(float)
-
-    field, niche_labels = build_difficulty_field(
-        expression=np.nan_to_num(expression, nan=0.0),
-        coords=coords
-    )
-    
-    
-    
-    report = run_evaluation(
-        curriculum_model=model,
-        baseline_model=baseline_model,
-        test_loader=test_loader,
-        field=field,
-        training_log=TrainingLog(),
-        device=device,
-        expression=np.nan_to_num(expression, nan=0.0),   # NEW
-        niche_labels=niche_labels,                         # NEW
-    )
-
-    # ── Save results (optional) ──
-    if args.output_json:
-        from dataclasses import asdict
-        output = asdict(report)
-        # Convert numpy arrays / floats to plain Python types
-        def _convert(obj):
-            if isinstance(obj, dict):
-                return {k: _convert(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [_convert(v) for v in obj]
-            if isinstance(obj, (np.floating,)):
-                return float(obj)
-            if isinstance(obj, (np.integer,)):
-                return int(obj)
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            return obj
-        output = _convert(output)
-        (ckpt_dir / args.output_json).write_text(
-            json.dumps(output, indent=2, default=str)
+        # ── Build dataset for this fold ──
+        fold_cfg = deepcopy(cfg)
+        fold_cfg.dataset.fold = fold
+        data_root = Path(fold_cfg.dataset.data_root).resolve() if fold_cfg.dataset.data_root else None
+        data_cfg = DataConfig(
+            dataset=fold_cfg.dataset.name, fold=fold,
+            adj=True, flatten=fold_cfg.dataset.flatten, data_root=data_root,
         )
-        print(f"[Eval] Results saved to {ckpt_dir / args.output_json}")
+        test_base = load_dataset(data_cfg, train=False)
+        test_loader = build_slide_loader(
+            test_base, slide_index=fold_cfg.dataset.test_slide_index,
+            batch_size=fold_cfg.training.batch_size,
+            num_workers=fold_cfg.training.num_workers,
+        )
+
+        # ── Build models ──
+        model = _build_model(fold_cfg.model.module, fold_cfg.model.class_name, fold_cfg.model.kwargs)
+        baseline_model = _build_model(fold_cfg.model.module, fold_cfg.model.class_name, fold_cfg.model.kwargs)
+        if fold_cfg.pipeline.wrap_model:
+            model = SpatialModelAdapter(model)
+            baseline_model = SpatialModelAdapter(baseline_model)
+
+        # ── Load per-fold checkpoints ──
+        fold_ckpt_dir = base_ckpt_dir / f"fold_{fold}"
+        ckpt_path = fold_ckpt_dir / "curriculum_model.pt"
+        base_ckpt_path = fold_ckpt_dir / "baseline_model.pt"
+
+        if ckpt_path.exists():
+            model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+            print(f"[Fold {fold}] Loaded curriculum model from {ckpt_path}")
+        else:
+            print(f"[Fold {fold}] WARNING: {ckpt_path} not found — using random weights")
+        if base_ckpt_path.exists():
+            baseline_model.load_state_dict(torch.load(base_ckpt_path, map_location="cpu"))
+            print(f"[Fold {fold}] Loaded baseline model from {base_ckpt_path}")
+        else:
+            print(f"[Fold {fold}] WARNING: {base_ckpt_path} not found — using random weights")
+
+        model.to(device)
+        baseline_model.to(device)
+
+        # ── Build difficulty field ──
+        slide_name = test_base.names[fold_cfg.dataset.test_slide_index]
+        expression = np.nan_to_num(test_base.exp_dict[slide_name], nan=0.0)
+        coords = test_base.center_dict[slide_name].astype(float)
+
+        field, niche_labels = build_difficulty_field(
+            expression=expression,
+            coords=coords,
+        )
+
+        # ── Run evaluation ──
+        report = run_evaluation(
+            curriculum_model=model,
+            baseline_model=baseline_model,
+            test_loader=test_loader,
+            field=field,
+            training_log=TrainingLog(),
+            device=device,
+            expression=expression,
+            niche_labels=niche_labels,
+        )
+
+        per_fold_reports[fold] = _convert_for_json(report)
+
+    # ── Aggregate across folds ──
+    print(f"\n\n{'='*60}")
+    print("  CROSS-FOLD SUMMARY")
+    print(f"{'='*60}")
+
+    # Compute mean metrics across folds
+    def _mean_metric(key_path: str) -> float:
+        vals = []
+        for fold_report in per_fold_reports.values():
+            val = fold_report
+            for k in key_path.split("."):
+                if isinstance(val, dict):
+                    val = val.get(k, None)
+                else:
+                    val = None
+                    break
+            if val is not None and isinstance(val, (int, float)):
+                vals.append(val)
+        return float(np.mean(vals)) if vals else float("nan")
+
+    def _safe_get(report: dict, key_path: str):
+        val = report
+        for k in key_path.split("."):
+            if isinstance(val, dict):
+                val = val.get(k, None)
+            else:
+                return None
+        return val
+
+    # Overall metrics
+    print(f"\n  {'Metric':<40} {'Mean':>10} {'Std':>10}")
+    print(f"  {'-'*62}")
+    for metric_key, metric_label in [
+        ("curriculum_PCC",   "Curriculum PCC"),
+        ("baseline_PCC",     "Baseline PCC"),
+        ("curriculum_MSE",   "Curriculum MSE"),
+        ("baseline_MSE",     "Baseline MSE"),
+    ]:
+        vals = [_safe_get(r, metric_key) for r in per_fold_reports.values()]
+        vals_f = [v for v in vals if v is not None and isinstance(v, (int, float))]
+        if vals_f:
+            print(f"  {metric_label:<40} {np.mean(vals_f):>10.4f} {np.std(vals_f):>10.4f}")
+        else:
+            print(f"  {metric_label:<40} {'N/A':>10}")
+
+    # Difficulty-error correlation
+    paper_pearson_vals = [
+        _safe_get(r, "paper_metrics.difficulty_error_pearson")
+        for r in per_fold_reports.values()
+    ]
+    paper_spearman_vals = [
+        _safe_get(r, "paper_metrics.difficulty_error_spearman")
+        for r in per_fold_reports.values()
+    ]
+    paper_pearson_f = [v for v in paper_pearson_vals if v is not None and isinstance(v, (int, float))]
+    paper_spearman_f = [v for v in paper_spearman_vals if v is not None and isinstance(v, (int, float))]
+    print(f"\n  Difficulty-Error Correlation:")
+    if paper_pearson_f:
+        print(f"  {'  Pearson r':<40} {np.mean(paper_pearson_f):>10.4f} ± {np.std(paper_pearson_f):>10.4f}")
+    if paper_spearman_f:
+        print(f"  {'  Spearman ρ':<40} {np.mean(paper_spearman_f):>10.4f} ± {np.std(paper_spearman_f):>10.4f}")
+
+    # Component correlations
+    comp_names = ["heterogeneity", "topology", "ambiguity"]
+    for comp in comp_names:
+        spearman_vals = [
+            _safe_get(r, f"component_correlations.{comp}.spearman")
+            for r in per_fold_reports.values()
+        ]
+        pearson_vals = [
+            _safe_get(r, f"component_correlations.{comp}.pearson")
+            for r in per_fold_reports.values()
+        ]
+        s_f = [v for v in spearman_vals if v is not None and isinstance(v, (int, float))]
+        p_f = [v for v in pearson_vals if v is not None and isinstance(v, (int, float))]
+        if s_f:
+            print(f"  {comp:<15} Spearman: {np.mean(s_f):>7.4f} ± {np.std(s_f):<7.4f}  "
+                  f"Pearson:  {np.mean(p_f):>7.4f} ± {np.std(p_f):<7.4f}")
+
+    # Per-fold detail
+    print(f"\n  Per-Fold Detail:")
+    print(f"  {'Fold':>6} {'Curr PCC':>10} {'Base PCC':>10} {'Curr MSE':>10} {'Base MSE':>10} "
+          f"{'Pearson r':>10} {'Spearman ρ':>10}")
+    print(f"  {'-'*68}")
+    for fold in sorted(per_fold_reports.keys()):
+        r = per_fold_reports[fold]
+        cp = _safe_get(r, "curriculum_PCC")
+        bp = _safe_get(r, "baseline_PCC")
+        cm = _safe_get(r, "curriculum_MSE")
+        bm = _safe_get(r, "baseline_MSE")
+        pr = _safe_get(r, "paper_metrics.difficulty_error_pearson")
+        sr = _safe_get(r, "paper_metrics.difficulty_error_spearman")
+        def _fmt(v):
+            return f"{v:>10.4f}" if v is not None else f"{'N/A':>10}"
+        print(f"  {fold:>6} {_fmt(cp)} {_fmt(bp)} {_fmt(cm)} {_fmt(bm)} {_fmt(pr)} {_fmt(sr)}")
+
+    # ── Save unified report ──
+    if args.output_json:
+        unified = {
+            "config": {
+                "dataset": cfg.dataset.name,
+                "folds": args.folds,
+                "model": cfg.model.class_name,
+            },
+            "per_fold": per_fold_reports,
+            "summary": {
+                "curriculum_PCC_mean": _mean_metric("curriculum_PCC"),
+                "curriculum_PCC_std": float(np.std([_safe_get(r, "curriculum_PCC") for r in per_fold_reports.values() if _safe_get(r, "curriculum_PCC") is not None])),
+                "baseline_PCC_mean": _mean_metric("baseline_PCC"),
+                "baseline_PCC_std": float(np.std([_safe_get(r, "baseline_PCC") for r in per_fold_reports.values() if _safe_get(r, "baseline_PCC") is not None])),
+                "curriculum_MSE_mean": _mean_metric("curriculum_MSE"),
+                "baseline_MSE_mean": _mean_metric("baseline_MSE"),
+                "difficulty_error_pearson_mean": _mean_metric("paper_metrics.difficulty_error_pearson"),
+                "difficulty_error_spearman_mean": _mean_metric("paper_metrics.difficulty_error_spearman"),
+            },
+        }
+        out_path = Path(args.output_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(unified, indent=2, default=str))
+        print(f"\n[Eval] Unified cross-fold report saved to {out_path}")
+
+    print(f"\n{'='*60}")
+    print("  EVALUATION COMPLETE")
+    print(f"{'='*60}")
