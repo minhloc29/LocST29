@@ -21,14 +21,6 @@ def component_wise_difficulty_correlation(
     niche_labels: np.ndarray,
     per_spot_error: np.ndarray,
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Correlate each RAW niche-difficulty component (heterogeneity, topology,
-    ambiguity) against actual per-spot prediction error, independently of
-    the composite weighting (alpha/beta/gamma).
-
-    This isolates which component actually carries predictive signal,
-    rather than testing only the final weighted score.
-    """
 
     K = int(niche_labels.max()) + 1
 
@@ -1248,8 +1240,7 @@ if __name__ == "__main__":
 
     field, niche_labels = build_difficulty_field(
         expression=np.nan_to_num(expression, nan=0.0),
-        coords=coords,
-        k_neighbours=cfg.difficulty.k_neighbours,
+        coords=coords
     )
     
     

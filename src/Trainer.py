@@ -8,6 +8,7 @@ import torch.nn as nn
 from pathlib import Path
 from typing import Optional, Callable, Tuple
 
+from src.niche import niche_difficulty_from_data
 from src.utils import Phase1Results, _seed_everything, move_to_device
 from src.curriculum import (
     train_curriculum, TrainingLog,
@@ -39,8 +40,7 @@ def build_difficulty_repo(
                 "niche_labels": np.ndarray [N_spots],
             }}
     """
-    from .difficulty_gse import topological_difficulty_from_data, niche_difficulty_from_data
-
+    
     repo = {}
 
     print(f"[DifficultyRepo] Computing per-slide difficulty from expression "

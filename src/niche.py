@@ -1,13 +1,3 @@
-"""Niche / Microenvironment construction and analysis for spatial transcriptomics.
-
-A *niche* is a spatially contiguous group of spots that share similar
-gene expression profiles — a biological microenvironment.
-
-Niche-level operations are the foundation of **biologically-aware
-curriculum learning**, where difficulty is assigned to microenvironments
-rather than individual spots.
-"""
-
 from __future__ import annotations
 
 from typing import Optional, Tuple
@@ -20,7 +10,7 @@ from sklearn.decomposition import PCA
 from scipy.sparse import csr_matrix, diags
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
-
+from scipy.stats import rankdata
 
 @dataclass
 class SpatialDynamicsField:
@@ -32,29 +22,23 @@ class SpatialDynamicsField:
     def N(self) -> int:
         return len(self.difficulty_score)
 
+
+def _rank_norm(x):
+    
+    r = rankdata(x, method="average")
+    return ((r - 1) / max(len(r) - 1, 1)).astype(np.float32)
+
+def _norm(x):
+        lo, hi = x.min(), x.max()
+        return np.zeros_like(x, dtype=np.float32) if hi - lo < 1e-10 else ((x - lo) / (hi - lo)).astype(np.float32)
+    
 def build_spatial_adjacency(
     coords: np.ndarray,
     k: int = 6,
     weight: str = "binary",   # "binary" | "distance" | "gaussian"
     sigma: float = 1.0,
 ) -> csr_matrix:
-    """
-    Build a sparse k-NN adjacency matrix from 2D spot coordinates.
-
-    Parameters
-    ----------
-    coords  : (N, 2) pixel coordinates
-    k       : number of nearest neighbours
-    weight  : edge weighting scheme
-                "binary"   → 1 for all edges
-                "distance" → 1 / (dist + 1e-8)
-                "gaussian" → exp(-dist² / (2σ²))
-    sigma   : bandwidth for gaussian weights (in same units as coords)
-
-    Returns
-    -------
-    A : (N, N) symmetric sparse adjacency matrix
-    """
+    
     N = coords.shape[0]
     nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(coords)
     distances, indices = nbrs.kneighbors(coords)
@@ -340,16 +324,7 @@ def niche_ambiguity(
     expression: np.ndarray,
     niche_labels: np.ndarray,
 ) -> np.ndarray:
-    """Per-spot ambiguity of niche membership.
-
-    A spot is *ambiguous* when it is nearly as close to a different niche's
-    centroid as it is to its own — i.e. it sits near a niche boundary in
-    expression space.
-
-    Returns
-    -------
-    ambiguity : (N,) array, higher = more ambiguous (harder).
-    """
+    
     K = int(niche_labels.max()) + 1
     centroids = np.zeros((K, expression.shape[1]), dtype=np.float64)
 
@@ -397,31 +372,24 @@ def compute_niche_difficulty(
     topo = niche_topology_difficulty(niche_labels, coords, expression)
     amb_per_spot = niche_ambiguity(expression, niche_labels)
 
-    def _norm(x):
-        lo, hi = x.min(), x.max()
-        return np.zeros_like(x, dtype=np.float32) if hi - lo < 1e-10 else ((x - lo) / (hi - lo)).astype(np.float32)
+    het_n = _rank_norm(het)
+    topo_n = _rank_norm(topo)
 
-    het_n = _norm(het)
-    topo_n = _norm(topo)
-
-    # Niche-level score (for heterogeneity + topology only)
     niche_scores = alpha * het_n + beta * topo_n
-    # broadcast the niche-level part to spots
     spot_scores = np.array([niche_scores[int(lbl)] for lbl in niche_labels], dtype=np.float32)
 
     if use_spot_level_ambiguity:
-        # NEW: add spot-level ambiguity directly, no niche averaging
-        amb_n_spot = _norm(amb_per_spot)
+        amb_n_spot = _rank_norm(amb_per_spot)
         spot_scores = spot_scores + gamma * amb_n_spot
-        # also compute a niche-level mean for reporting/dashboard purposes only
         amb_niche_mean = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
-        niche_scores = niche_scores + gamma * _norm(amb_niche_mean)
+        niche_scores = niche_scores + gamma * _rank_norm(amb_niche_mean)
     else:
         amb = np.array([amb_per_spot[niche_labels == k].mean() for k in range(K)])
-        amb_n = _norm(amb)
+        amb_n = _rank_norm(amb)
         niche_scores = niche_scores + gamma * amb_n
         spot_scores = spot_scores + gamma * amb_n[niche_labels]
 
+    print(f"Check scores: {het_n, topo_n, amb_n_spot}")
     return niche_scores, spot_scores
 
 
